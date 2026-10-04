@@ -35,7 +35,7 @@ from aiplatform import privates
 from aiplatform.ai_clients import PRESETS, call_client, list_clients, register_client
 from aiplatform.build_platform import build
 from aiplatform.semantic import GenericSemanticQuery
-from aiplatform.upload import UPSTREAM_DIR, ingest_file
+from aiplatform.upload import ingest_file, save_upload_bytes
 
 st.set_page_config(page_title="ECNU DataOS · 面向 AI 的大数据平台", layout="wide",
                    page_icon="AI", initial_sidebar_state="expanded")
@@ -256,24 +256,25 @@ def _handle_upload(uploaded) -> None:
     if uploaded is None:
         st.warning("请先选择一个文件。")
         return
-    with st.spinner(f"解析 {uploaded.name} -> 推断语义映射 -> 写入统一图 ..."):
-        os.makedirs(UPSTREAM_DIR, exist_ok=True)
-        tmp_path = os.path.join(UPSTREAM_DIR, uploaded.name)
-        with open(tmp_path, "wb") as fh:
-            fh.write(uploaded.getvalue())
+    try:
+        tmp_path, display_name = save_upload_bytes(uploaded.name, uploaded.getvalue())
+    except Exception as exc:
+        st.error(f"接入失败：{type(exc).__name__}: {exc}")
+        return
+    with st.spinner(f"解析 {display_name} -> 推断语义映射 -> 写入统一图 ..."):
         uid = st.session_state.get("uid")
         try:
             if uid:
                 partition = st.session_state.get("cur_partition", "user_0")
                 priv_graph = privates.load_partition_g(uid, partition)
                 proxy = privates.UserGraphProxy(onto, priv_graph)
-                source_id = f"priv_{privates.safe_uid(uid)}_{partition}_{_stable_hash(uploaded.name, 10000)}"
-                report = ingest_file(proxy, cat, tmp_path, uploaded.name, source_id=source_id)
+                source_id = f"priv_{privates.safe_uid(uid)}_{partition}_{_stable_hash(display_name, 10000)}"
+                report = ingest_file(proxy, cat, tmp_path, display_name, source_id=source_id)
                 privates.save_partition(uid, partition, priv_graph)
                 _rebuild_query()
             else:
-                source_id = f"ds_upload_{_stable_hash(uploaded.name, 100000)}"
-                report = ingest_file(graph, cat, tmp_path, uploaded.name, source_id=source_id)
+                source_id = f"ds_upload_{_stable_hash(display_name, 100000)}"
+                report = ingest_file(graph, cat, tmp_path, display_name, source_id=source_id)
                 _rebuild_query()
             st.session_state.setdefault("uploads", []).append(report)
             if report.get("error"):
@@ -281,7 +282,7 @@ def _handle_upload(uploaded) -> None:
             else:
                 count = (report.get("report") or {}).get("triples", 0)
                 scope = "私人库" if uid else "公共资产"
-                st.success(f"{uploaded.name} 已写入{scope}：{count} 条三元组")
+                st.success(f"{display_name} 已写入{scope}：{count} 条三元组")
                 st.rerun()
         except Exception as exc:
             st.error(f"接入失败：{type(exc).__name__}: {exc}")

@@ -4,14 +4,49 @@
 """
 import hashlib
 import os, sys, json, shutil
+import uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from aiplatform.documents import ingest_any, detect_kind
+from aiplatform.documents import SUPPORTED, ingest_any, detect_kind
 from aiplatform.auto_map import infer_mapping
 from aiplatform.core import SemanticMapper, RES, ONTO, RDF, Literal, XSD
 
 UPSTREAM_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "data", "raw", "uploads")
 os.makedirs(UPSTREAM_DIR, exist_ok=True)
+
+
+def safe_upload_name(filename):
+    """返回不含目录片段的显示文件名，拒绝空名称和控制字符。"""
+    name = os.path.basename(str(filename or "").replace("\\", "/")).strip()
+    if not name or name in {".", ".."} or "\x00" in name:
+        raise ValueError("上传文件名无效")
+    return name
+
+
+def save_upload_bytes(filename, data, root=None):
+    """
+    使用服务端随机文件名保存上传内容，返回 (存储路径, 原始显示名)。
+
+    上传内容永远写入上传根目录；原始文件名只用于展示、类型识别和映射。
+    """
+    display_name = safe_upload_name(filename)
+    ext = os.path.splitext(display_name)[1].lower()
+    if ext not in SUPPORTED:
+        raise ValueError(f"不支持的文件类型：{ext or '无扩展名'}")
+
+    upload_root = os.path.realpath(root or UPSTREAM_DIR)
+    os.makedirs(upload_root, exist_ok=True)
+    stored_path = os.path.realpath(os.path.join(upload_root, uuid.uuid4().hex + ext))
+    try:
+        inside_root = os.path.commonpath([upload_root, stored_path]) == upload_root
+    except ValueError:
+        inside_root = False
+    if not inside_root:
+        raise ValueError("上传目标越界")
+
+    with open(stored_path, "xb") as fh:
+        fh.write(data)
+    return stored_path, display_name
 
 
 def _rows_from_sheet(columns, rows):
