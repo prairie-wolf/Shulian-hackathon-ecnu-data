@@ -22,7 +22,10 @@ PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
 class PlatformTools:
     def __init__(self, graph, catalog=None):
-        self.g = graph
+        # 归一化：调用方传的对象不一致——api_server 传 UnifiedGraph（真正的图在 .g），
+        # gateway / mcp_server 传裸 rdflib Graph。UnifiedGraph 本身没有 triples/subjects/value，
+        # 统一取出内层裸图，避免各方法在不同调用路径下随机 AttributeError。
+        self.g = getattr(graph, "g", graph)
         self._catalog = catalog
 
     # ---- 基础工具（本体驱动，通用）----
@@ -53,12 +56,28 @@ class PlatformTools:
         return {"class": class_name, "instances": len(ents),
                 "samples": samples, "sample_count": len(samples)}
 
+    def _alias_uris(self):
+        """被 sameAs 指向的等价实体。展示时隐藏别名、只留规范实体，
+        避免同一家公司（来自两个数据源）在结果里出现两次。"""
+        out = set()
+        for _s, o in self.g.subject_objects(ONTO.sameAs):
+            out.add(o)
+        return out
+
     def find_entity(self, class_name, keyword, limit=10, offset=0):
             """按名称搜索某类实体（支持分页 offset）。同时匹配 name 与 cnLabel（中文标签），大小写不敏感。"""
             cls = URIRef(ONTO_NS + class_name) if not str(class_name).startswith("http") else URIRef(class_name)
             kw = (keyword or "").lower()
+            # 空关键词会匹配全部实体，等于把整类倒出来 —— 明确报错，别装作查到了
+            if not kw.strip():
+                return {"class": class_name, "keyword": keyword, "matches": [],
+                        "total": 0, "offset": offset, "limit": limit, "has_more": False,
+                        "error": "keyword 不能为空：本工具按名称搜索，空关键词会匹配全部实体。"}
+            aliases = self._alias_uris()
             out = []
             for e in self.g.subjects(RDF.type, cls):
+                if e in aliases:          # sameAs 的别名不重复展示
+                    continue
                 nm = self._entity_name(e)
                 cn = self.g.value(e, ONTO.cnLabel)
                 hit = kw in nm.lower()
@@ -75,9 +94,12 @@ class PlatformTools:
     def search_cross_class(self, keyword, limit=20):
         """跨类检索：在全部分类的 name/cnLabel 中模糊匹配，返回带类别与 id。"""
         kw = (keyword or "").lower()
+        if not kw.strip():
+            return []
+        aliases = self._alias_uris()      # sameAs 的别名不重复展示
         out, seen = [], set()
         for e in self.g.subjects(RDF.type, None):
-            if e in seen:
+            if e in seen or e in aliases:
                 continue
             nm = self._entity_name(e)
             cn = self.g.value(e, ONTO.cnLabel)
@@ -155,7 +177,7 @@ class PlatformTools:
                     "sources": [s["name"] for s in self._catalog.list()] if getattr(self, "_catalog", None) else []}
         if "本体" in q and ("哪些" in q or "列出" in q or "结构" in q):
             return self.list_ontology()
-        return GenericSemanticQuery(self.g.g).ask(question)
+        return GenericSemanticQuery(self.g).ask(question)
 
     def _all_industry_names(self):
         out = []

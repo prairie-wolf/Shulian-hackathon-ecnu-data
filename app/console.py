@@ -35,7 +35,7 @@ from aiplatform import privates
 from aiplatform.ai_clients import PRESETS, call_client, list_clients, register_client
 from aiplatform.build_platform import build
 from aiplatform.semantic import GenericSemanticQuery
-from aiplatform.upload import UPSTREAM_DIR, ingest_file
+from aiplatform.upload import UPSTREAM_DIR, ingest_file, persist_public, public_snapshot
 
 st.set_page_config(page_title="ECNU DataOS · 面向 AI 的大数据平台", layout="wide",
                    page_icon="AI", initial_sidebar_state="expanded")
@@ -273,7 +273,13 @@ def _handle_upload(uploaded) -> None:
                 _rebuild_query()
             else:
                 source_id = f"ds_upload_{_stable_hash(uploaded.name, 100000)}"
+                _before = public_snapshot(graph)
                 report = ingest_file(graph, cat, tmp_path, uploaded.name, source_id=source_id)
+                # 落盘，否则重启即丢（未登录上传以前只写内存）
+                _saved = persist_public(graph, _before)
+                if _saved:
+                    report.setdefault("steps", []).append(
+                        {"step": "⑤ 已持久化公共上传", "triples": _saved})
                 _rebuild_query()
             st.session_state.setdefault("uploads", []).append(report)
             if report.get("error"):
@@ -414,9 +420,9 @@ def _extract_names(result: dict) -> list[str]:
 
 
 def _humanize_result(question: str, result: dict) -> str:
-    apology = ("抱歉，这个问题我暂时还没理解清楚。你可以换个更明确的问法试试，"
-               "例如：“华东师范大学有哪些学者？”、“大语言模型趋势”、"
-               "“物流快递行业有哪些公司？”。")
+    apology = ("这个问题不在平台的数据范围内。我是科研与企业数据的语义问答助手，"
+               "可以问学者、论文、机构、企业、行业、领域相关的问题，例如："
+               "“华东师范大学有哪些学者？”、“大语言模型趋势”、“物流快递行业有哪些公司？”。")
     if not isinstance(result, dict):
         return apology
     intent = result.get("intent", "unknown")
@@ -439,6 +445,17 @@ def _humanize_result(question: str, result: dict) -> str:
             summary = "、".join(f"{k} {v} 个" for k, v in list(classes.items())[:12])
             return f"平台当前覆盖 {len(classes)} 类数据：{summary}。"
         return apology
+    if intent in ("not_found", "unsupported_attribute", "smalltalk"):
+        return result.get("hint") or apology
+    # 趋势/逐年：必须排在下面通用分支之前。否则通用分支会把 data[].name 抽成
+    # ["2022","2023",...] 直接返回，逐年数量（2/34/126/38）全丢了。
+    if intent in ("trend", "year_distribution"):
+        rows = [x for x in (result.get("data") or []) if isinstance(x, dict)]
+        if rows:
+            total = sum(int(x.get("count") or 0) for x in rows)
+            span = "、".join(f"{x.get('name')} 年 {int(x.get('count') or 0)} 篇" for x in rows[:6])
+            return (f"共统计 {len(rows)} 个时间点、{total} 篇论文：{span}。"
+                    f"完整曲线见右侧趋势图。")
     names = _extract_names(result)
     if names:
         count = int(result.get("count") or result.get("total") or len(names))
@@ -457,6 +474,7 @@ def _humanize_result(question: str, result: dict) -> str:
             "list_class": "实例",
             "cls_list": "实例",
             "list_sources": "数据源",
+            "entity_publications": "论文",
         }.get(intent, "结果")
         return f"这个问题共查到 {count} 条{label}相关数据，主要结果：{'、'.join(names)}。"
     if intent == "trend" or intent == "year_distribution":
@@ -483,6 +501,11 @@ def _answer_with_ai(question: str, picked: dict) -> tuple[dict, list[dict], str]
     answer = response.get("content") or _humanize_result(question, result)
     trace.append({"step": "AI 生成答案", "backend": response.get("backend"),
                   "elapsed_ms": response.get("elapsed_ms"), "error": response.get("error")})
+    if not response.get("content"):
+        # 调用失败时必须说清楚：答案来自平台本地引擎，不是这个 AI 生成的。
+        # 否则界面把模板答案署名成"DeepSeek · deepseek-chat"，属于误导性归因。
+        answer = (f"⚠️ {picked['name']} 调用失败（{response.get('error') or '无返回'}）。\n\n"
+                  f"以下是**平台本地语义引擎**的结果，未经大模型润色：\n\n{answer}")
     return result, trace, answer
 
 
@@ -503,7 +526,11 @@ def render_chat() -> None:
     page_header("语义问答", "自然语言问题会先进入本体语义层，再交给选定 AI 生成可核验答案。", "语义引擎就绪")
     clients = list_clients()
     labels = ["— 选择 AI —"] + [c["name"] for c in clients]
-    picked_name = st.selectbox("驱动 AI", labels, index=0, key="chat_ai", label_visibility="collapsed")
+    # 默认选中"本平台端点"（kind=platform）：它不需要任何 Key。
+    # 修：原来默认停在占位项，页面一进来没有输入框，等于先逼用户去下拉框里挑一个 AI。
+    default_idx = next((i + 1 for i, c in enumerate(clients) if c.get("kind") == "platform"), 0)
+    picked_name = st.selectbox("驱动 AI", labels, index=default_idx, key="chat_ai",
+                               label_visibility="collapsed")
     picked = next((c for c in clients if c["name"] == picked_name), None)
     if picked is None:
         empty_state("选择一个 AI 客户端开始问答；平台自身和本地规则引擎无需外部 Key。")
@@ -545,9 +572,15 @@ def render_chat() -> None:
             with st.chat_message("assistant"):
                 with st.spinner("正在执行本体语义查询 ..."):
                     result, trace, answer = _answer_with_ai(question, picked)
+                _ai_step = next((s for s in trace if s.get("step") == "AI 生成答案"), None)
+                _failed = bool(_ai_step and _ai_step.get("error"))
                 st.markdown(answer)
-                st.caption(f"{picked['name']} · {picked.get('model', '')}")
-            st.session_state.messages.append({"role": "assistant", "content": answer, "meta": picked["name"]})
+                st.caption("⚠️ 大模型未生效 · 以上为平台本地语义引擎结果" if _failed
+                           else f"{picked['name']} · {picked.get('model', '')}")
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer,
+                 "meta": (f"⚠️ 本地语义引擎（{picked['name']} 未生效）" if _failed
+                          else picked["name"])})
             st.session_state.last = {"trace": trace, "result": result, "question": question, "picked": picked}
             st.session_state["scroll_to_chat"] = True
         _scroll_to_latest()

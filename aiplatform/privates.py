@@ -43,8 +43,7 @@ def save_user_priv(uid, g, idx=0):
     """把用户私有图落盘（idx 用于分文件，见 list_partitions）"""
     d = user_priv_dir(uid)
     out = os.path.join(d, f"user_{idx}.ttl")
-    with open(out, "wb") as f:
-        g.serialize(f, format="turtle")
+    g.serialize(destination=out, format="turtle")   # 传路径而非文件对象（见 new_partition 注释）
     return out
 
 
@@ -105,8 +104,9 @@ def new_partition(uid, name):
     stem = _valid_name(name)
     d = user_priv_dir(uid)
     path = os.path.join(d, stem + ".ttl")
-    with open(path, "wb") as f:
-        Graph().serialize(f, format="turtle")
+    # 直接传路径字符串。传文件对象时 rdflib 会拿 Windows 路径当 base URI，
+    # 触发 "does not look like a valid URI, trying to serialize this will break."
+    Graph().serialize(destination=path, format="turtle")
     with open(os.path.join(d, stem + ".meta.json"), "w", encoding="utf-8") as f:
         json.dump({"name": name, "created": time.strftime("%Y-%m-%d")}, f, ensure_ascii=False)
     return stem
@@ -131,8 +131,7 @@ def save_partition(uid, pid, g):
     d = user_priv_dir(uid)
     stem = _valid_name(pid)
     out = os.path.join(d, stem + ".ttl")
-    with open(out, "wb") as f:
-        g.serialize(f, format="turtle")
+    g.serialize(destination=out, format="turtle")   # 传路径而非文件对象（见 new_partition 注释）
     return out
 
 

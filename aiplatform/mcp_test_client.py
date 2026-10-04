@@ -9,7 +9,7 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER = os.path.join(BASE, "platform", "mcp_server.py")
+SERVER = os.path.join(BASE, "aiplatform", "mcp_server.py")
 
 async def main():
     params = StdioServerParameters(command=sys.executable, args=[SERVER], cwd=BASE)

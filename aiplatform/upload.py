@@ -13,6 +13,54 @@ UPSTREAM_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
                             "data", "raw", "uploads")
 os.makedirs(UPSTREAM_DIR, exist_ok=True)
 
+# 公共上传的持久化文件。
+# 修：以前未登录上传只写内存，服务一重启数据就没了（会丢数据）。
+# 现在把「本次上传新增的三元组」落盘，build() 时再装回统一图。
+PUBLIC_TTL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "data", "processed", "public_uploads.ttl")
+
+
+def public_snapshot(graph):
+    """上传前拍一张快照，用于事后 diff 出本次新增的三元组"""
+    try:
+        return set(graph.g)
+    except Exception:
+        return set()
+
+
+def persist_public(graph, before):
+    """把 graph 中比 before 多出来的三元组，追加进公共上传持久化文件。返回新增条数"""
+    from rdflib import Graph as RDFGraph
+    try:
+        new = [t for t in graph.g if t not in before]
+    except Exception:
+        return 0
+    if not new:
+        return 0
+    store = RDFGraph()
+    if os.path.exists(PUBLIC_TTL):
+        try:
+            store.parse(PUBLIC_TTL, format="turtle")
+        except Exception:
+            pass
+    for t in new:
+        store.add(t)
+    store.serialize(destination=PUBLIC_TTL, format="turtle")
+    return len(new)
+
+
+def load_public_uploads(graph):
+    """启动时把上次持久化的公共上传数据装回统一图。返回装回的条数"""
+    if not os.path.exists(PUBLIC_TTL):
+        return 0
+    try:
+        before = len(graph.g)
+        with open(PUBLIC_TTL, "rb") as f:
+            graph.g.parse(f, format="turtle")
+        return len(graph.g) - before
+    except Exception:
+        return 0
+
 
 def _rows_from_sheet(columns, rows):
     return [dict(zip(columns, r)) for r in rows]
