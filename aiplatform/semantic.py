@@ -224,10 +224,20 @@ class GenericSemanticQuery:
     # ---------- 智能入口 ----------
     def ask(self, question):
         """通用自然语言问数"""
+        question = question.strip()
+        if re.fullmatch(r"(你好|您好|嗨|hello|hi|谢谢|感谢)[！!。？?\s]*", question, re.IGNORECASE):
+            return {"intent": "greeting", "hint": "你好，可以查询图谱中的实体、论文、关联学者或趋势。"}
+        if any(word in question for word in ("生日", "出生", "年龄", "电话", "邮箱", "住址", "校长", "毕业时间", "毕业年份")):
+            return {"intent": "unsupported", "question": question,
+                    "hint": "图谱未收录此字段，无法据此回答。"}
         LISTING = ("有哪些", "有什么", "列出", "所有", "全部", "清单", "列表")
         is_listing = any(k in question for k in LISTING)
         cls_list = self.find_mentioned_classes(question)
         ents = self.find_mentioned_entities(question)
+
+        if not ents and any(word in question for word in ("是谁", "介绍", "详情", "校友", "毕业生")):
+            return {"intent": "not_found", "question": question, "count": 0, "data": [],
+                    "hint": "未找到指定实体，请提供名称或标识。"}
 
         # 1) 趋势 / 逐年 / 分布
         if any(k in question for k in ("趋势", "逐年", "每年", "增长", "分布", "按年")):
@@ -246,6 +256,51 @@ class GenericSemanticQuery:
             data = self.year_distribution(fname)
             return {"intent": "trend", "field": fname or "全部论文", "data": data,
                     "total": sum(x["count"] for x in data)}
+
+        # 7) 某机构 + 某领域 的学者（返回带论文数的完整信息，而不是一串名字）
+        if any(k in question for k in ("学者", "老师", "教授", "校友", "毕业生", "教师", "成员")) and ents:
+            inst_uri = next((u for u, l in ents if self._class_of(u) == "Institution"), None)
+            field_uri = next((u for u, l in ents if self._class_of(u) == "Field"), None)
+            if inst_uri or field_uri:
+                # 收集学者 URI（保留 URI 才能取论文数/中文名）
+                if inst_uri:
+                    uris = {m["uri"] for m in self.reverse_related(inst_uri, "affiliatedWith")}
+                else:
+                    uris = set()
+                if field_uri:
+                    works = list(self.g.subjects(ONTO.belongsToField, field_uri))
+                    furi = set()
+                    for w in works:
+                        for a in self.g.subjects(ONTO.authorOf, w):
+                            furi.add(a)
+                    uris = uris & furi if inst_uri else furi
+
+                rows = []
+                seen_names = set()
+                for u in uris:
+                    n_works = len(list(self.g.objects(u, ONTO.authorOf)))
+                    cn = self.g.value(u, ONTO.cnLabel)
+                    en = self.g.value(u, ONTO.name)
+                    nm = str(cn) if cn else str(en)
+                    if nm in seen_names:  # 去重（同一学者多 URI 别名）
+                        continue
+                    seen_names.add(nm)
+                    insts = [self._label(i) for i in self.g.objects(u, ONTO.affiliatedWith)]
+                    rows.append({
+                        "name": nm,
+                        "en_name": str(en) if en else "",
+                        "papers": n_works,
+                        "institution": (insts[0] if insts else ""),
+                    })
+                rows.sort(key=lambda x: -x["papers"])
+                top = rows[:30]
+                return {"intent": "scholars_filtered",
+                        "scope": (self._label(inst_uri) if inst_uri else "") +
+                                 ((" · " + self._label(field_uri)) if field_uri else ""),
+                        "count": len(rows), "scholars": [r["name"] for r in top],
+                        "data": top, "returned": len(top), "has_more": len(rows) > len(top),
+                        "relation": "affiliatedWith" if inst_uri else "authorOf",
+                        "hint": "这里只列出平台记录的关联学者，机构关联不代表毕业关系。" if any(w in question for w in ("校友", "毕业生")) else ""}
 
         # 2) 实体详情（列举型问句不走这里）
         if (not is_listing) and ents and any(
@@ -341,49 +396,6 @@ class GenericSemanticQuery:
                             "count": len(members), "entities": [r["name"] for r in rows],
                             "data": rows}
 
-        # 7) 某机构 + 某领域 的学者（返回带论文数的完整信息，而不是一串名字）
-        if any(k in question for k in ("学者", "老师", "教授")) and ents:
-            inst_uri = next((u for u, l in ents if self._class_of(u) == "Institution"), None)
-            field_uri = next((u for u, l in ents if self._class_of(u) == "Field"), None)
-            if inst_uri or field_uri:
-                # 收集学者 URI（保留 URI 才能取论文数/中文名）
-                if inst_uri:
-                    uris = {m["uri"] for m in self.reverse_related(inst_uri, "affiliatedWith")}
-                else:
-                    uris = set()
-                if field_uri:
-                    works = list(self.g.subjects(ONTO.belongsToField, field_uri))
-                    furi = set()
-                    for w in works:
-                        for a in self.g.subjects(ONTO.authorOf, w):
-                            furi.add(a)
-                    uris = uris & furi if inst_uri else furi
-
-                rows = []
-                seen_names = set()
-                for u in uris:
-                    n_works = len(list(self.g.objects(u, ONTO.authorOf)))
-                    cn = self.g.value(u, ONTO.cnLabel)
-                    en = self.g.value(u, ONTO.name)
-                    nm = str(cn) if cn else str(en)
-                    if nm in seen_names:  # 去重（同一学者多 URI 别名）
-                        continue
-                    seen_names.add(nm)
-                    insts = [self._label(i) for i in self.g.objects(u, ONTO.affiliatedWith)]
-                    rows.append({
-                        "name": nm,
-                        "en_name": str(en) if en else "",
-                        "papers": n_works,
-                        "institution": (insts[0] if insts else ""),
-                    })
-                rows.sort(key=lambda x: -x["papers"])
-                top = rows[:30]
-                return {"intent": "scholars_filtered",
-                        "scope": (self._label(inst_uri) if inst_uri else "") +
-                                 ((" · " + self._label(field_uri)) if field_uri else ""),
-                        "count": len(rows), "scholars": [r["name"] for r in top],
-                        "data": top}
-
         # 8) 论文标题关键词检索
         kw = self._extract_keyword(question)
         if kw and ("论文" in question or "文献" in question or "研究" in question):
@@ -404,13 +416,9 @@ class GenericSemanticQuery:
         # 9) 按类列举
         if cls_list:
             c = cls_list[0]
-            items, total = self.entities_of_class(c)
-            filtered = [x for x in items if kw in str(x)] if kw else items
-            if filtered:
-                return {"intent": "list_class", "class": c, "count": len(filtered),
-                        "samples": filtered[:25]}
-            if items:
-                return {"intent": "list_class", "class": c, "count": total, "samples": items[:25]}
+            items, total = self.entities_of_class(c, limit=25)
+            return {"intent": "list_class", "class": c, "count": total,
+                    "samples": items, "returned": len(items), "has_more": total > len(items)}
 
         # 10) 关键词模糊匹配（全类）
         if kw:

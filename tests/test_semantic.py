@@ -28,5 +28,21 @@ class SemanticTests(unittest.TestCase):
                 self.assertEqual(self.q.ask(question)['intent'], 'not_found')
         self.assertEqual(self.q.ask('有哪些学者？')['intent'], 'list_class')
 
+    def test_a2_people_routing_and_unsupported(self):
+        field = self.entity('field', 'Field', 'Knowledge Graph', cnLabel='知识图谱')
+        author = self.entity('author', 'Scholar', 'Alice')
+        work = self.entity('work', 'Publication', 'A paper')
+        self.g.add((author, ONTO.authorOf, work))
+        self.g.add((work, ONTO.belongsToField, field))
+        for question in ('知识图谱领域有哪些学者？', '知识图谱领域的学者是谁？'):
+            result = self.q.ask(question)
+            self.assertEqual(result['intent'], 'scholars_filtered')
+            self.assertEqual(result['data'][0]['name'], 'Alice')
+        self.assertEqual(self.q.ask('张不存在是谁？')['intent'], 'not_found')
+        for question in ('Alice的生日是什么？', 'Alice的邮箱是什么？'):
+            self.assertEqual(self.q.ask(question)['intent'], 'unsupported')
+        self.assertEqual(self.q.ask('你好！')['intent'], 'greeting')
+        self.assertEqual(self.q.ask('Alice是谁？')['intent'], 'entity_detail')
+
 if __name__ == '__main__':
     unittest.main()
