@@ -66,5 +66,18 @@ class PublicBaselineTests(unittest.TestCase):
         self.assertEqual(result['count'], len(expected))
         print('Public baseline BIT associated scholars:', len(expected))
 
+    def test_public_company_evidence_and_deduplicated_listing(self):
+        from aiplatform.entity_equivalence import CompanyEquivalence, inferred_company_pairs
+        raw = set(self.graph.subjects(RDF.type, ONTO.Company))
+        pairs = list(inferred_company_pairs(self.graph))
+        view = CompanyEquivalence(self.graph)
+        expected = {view.representative(uri) for uri in raw}
+        result = self.query.ask('有哪些公司？')
+        self.assertEqual(result['count'], len(expected))
+        self.assertEqual(result['raw_count'], len(raw))
+        self.assertEqual(len(raw) - len(expected), len(pairs))
+        self.assertTrue(pairs)
+        print('Public baseline companies:', len(raw), 'display entities:', len(expected), 'evidenced pairs:', len(pairs))
+
 if __name__ == '__main__':
     unittest.main()
