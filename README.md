@@ -51,6 +51,8 @@
 
 ### Git 提交与个人配置
 
+阶段性更新使用普通本地 commit，正文附简短 `Notes:`；提交时间戳和安全 hook 的启用与规则见 [Agent Git 操作检查](docs/agent-git-hook.md)。
+
 `.gitignore` 排除本机 `ai_clients.json`、环境秘密、账号库、私人图、上传原件、
 虚拟环境、可重新生成的数据库/RDF/展示页，以及本地方案文档。
 运行所需的公开 CSV/JSON、语义映射和 OWL 本体仍纳入版本控制。

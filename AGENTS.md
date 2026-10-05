@@ -49,3 +49,16 @@ README 中的 test_all.py 当前不存在，不得宣称已执行。
 - 说明修改原因、结果、实际测试命令与结论，以及剩余风险和未验证项。
 - 提交前检查 git diff --check 与提交范围，排除凭据、用户数据、审查副本及生成产物。
 - 未获明确授权，不推送、合并、部署、删除真实数据或发送外部消息。
+
+## Agent Git 安全 Hook
+- 项目配置见 `.codex/hooks.json`，检查脚本见 `scripts/agent_git_guard.py`，启用步骤与边界见 `docs/agent-git-hook.md`。
+- Git 命令单独调用，避免与其他命令组合；普通本地 commit 在暂存区检查通过后允许，其他写入操作默认由 hook 拒绝。
+- 收到 `[Git 安全拦截]` 后立即向用户报告操作类别和失败原因；不得通过别名、脚本、编码、其他工具或修改 hook 绕过检查。
+- 被 hook 拒绝的 Git 写入操作须由用户核对后手动执行；授权本身不会关闭 hook。普通本地 commit 不受此限制。
+
+## 本地版本记录
+- 已授权在完成有一定规模且可独立回退的阶段更新后进行普通本地 commit；先验证，只暂存本次工作相关的显式文件，保留他人修改。
+- 提交使用简短标题，并在正文加 `Notes:`，简述修改原因、结果与实际验证；不使用独立 `git notes`。
+- 原生 Git 时间戳 hook 位于 `.githooks/prepare-commit-msg`，通过 `python scripts/install_git_hooks.py` 启用；该安装入口用于用户授权的 hook 配置维护，不用于绕过安全拦截。
+- 提交标题自动附加 Asia/Taipei 时间戳；新检出项目须重新安装 hook。此功能不依赖 Codex hook 的信任状态。
+- 大规模版本更新完成后建议用户创建附注 tag（如 `vX.Y.Z`）并推送分支及该 tag；说明理由与建议版本号，未获明确授权不执行 tag 或 push。

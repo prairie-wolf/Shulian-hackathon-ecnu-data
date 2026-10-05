@@ -46,7 +46,8 @@ htmlcov/
 /方案文档/
 
 # Local tooling, logs and temporary files
-/.codex/
+/.codex/*
+!/.codex/hooks.json
 /.agents/
 /.aws/
 /.vscode/

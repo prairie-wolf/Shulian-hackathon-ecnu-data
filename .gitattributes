@@ -1,0 +1,2 @@
+# Git executes this script through sh; CRLF would break the interpreter.
+/.githooks/* text eol=lf
