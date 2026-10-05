@@ -64,6 +64,9 @@ for short, full in {'北理工': '北京理工大学', '北大': '北京大学',
 
 def mentioned_entities(graph, question):
     """Return all candidates for non-overlapping longest mentions, preserving URIs."""
+    explicit = [entity for entity in graph.subjects(RDF.type, None) if str(entity) in question]
+    if explicit:
+        return [(entity, str(entity)) for entity in sorted(set(explicit), key=str)]
     candidates = {}
     for predicate in (ONTO.name, ONTO.cnLabel):
         for entity, _, value in graph.triples((None, predicate, None)):

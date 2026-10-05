@@ -67,5 +67,22 @@ class SemanticTests(unittest.TestCase):
         result = self.q.ask('复旦知识图谱领域有哪些论文？')
         self.assertEqual((result['count'], result['returned'], result['has_more']), (4, 4, False))
 
+    def test_a4_country_ambiguity_and_live_mutations(self):
+        us = self.entity('neu-us', 'Institution', 'Northeastern University', country='US', cnLabel='东北大学')
+        self.assertEqual(self.q.ask('东北大学有哪些学者？')['intent'], 'not_found')
+        cn = self.entity('neu-cn', 'Institution', 'Northeastern University', country='CN')
+        self.assertEqual(self.q.find_mentioned_entities('东北大学有哪些学者？'), [(cn, '东北大学')])
+        result = self.q.ask('Northeastern University有哪些学者？')
+        self.assertEqual(result['intent'], 'ambiguous')
+        self.assertEqual({row['uri'] for row in result['data']}, {str(us), str(cn)})
+        self.g.remove((cn, None, None))
+        self.assertEqual(self.q.find_mentioned_entities('东北大学有哪些学者？'), [])
+        other = self.entity('neu-cn-new', 'Institution', 'Northeastern University', country='CN')
+        self.assertEqual(self.q.find_mentioned_entities('东北大学有哪些学者？')[0][0], other)
+        a = self.entity('homonym1', 'Scholar', 'Alice')
+        b = self.entity('homonym2', 'Scholar', 'Alice')
+        self.assertEqual(self.q.ask('Alice是谁？')['intent'], 'ambiguous')
+        self.assertEqual(self.q.ask(str(a) + '是谁？')['intent'], 'entity_detail')
+
 if __name__ == '__main__':
     unittest.main()

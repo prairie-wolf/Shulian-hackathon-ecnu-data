@@ -250,6 +250,17 @@ class GenericSemanticQuery:
         cls_list = self.find_mentioned_classes(question)
         ents = self.find_mentioned_entities(question)
 
+        mentions = {}
+        for uri, label in ents:
+            mentions.setdefault(label.casefold(), []).append(uri)
+        ambiguous = next((uris for uris in mentions.values() if len(uris) > 1), None)
+        if ambiguous:
+            return {"intent": "ambiguous", "question": question, "count": len(ambiguous),
+                    "data": [{"uri": str(uri), "name": self._label(uri), "class": self._class_of(uri),
+                              "country": sorted(str(v) for v in self.g.objects(uri, ONTO.country))}
+                             for uri in ambiguous],
+                    "hint": "存在同名实体，请使用 URI 或补充身份信息确认。"}
+
         if not ents and any(word in question for word in ("是谁", "介绍", "详情", "校友", "毕业生")):
             return {"intent": "not_found", "question": question, "count": 0, "data": [],
                     "hint": "未找到指定实体，请提供名称或标识。"}

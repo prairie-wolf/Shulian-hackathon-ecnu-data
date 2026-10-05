@@ -54,5 +54,17 @@ class PublicBaselineTests(unittest.TestCase):
         self.assertTrue({URIRef(row['uri']) for row in result['data']} <= expected)
         print('Public baseline Fudan publications:', len(expected), 'returned:', result['returned'])
 
+    def test_chinese_institutions_use_expected_uris(self):
+        bit = URIRef('http://ecnu.edu.cn/resource/i_I125839683')
+        neu = URIRef('http://ecnu.edu.cn/resource/i_I9224756')
+        self.assertEqual(self.query.find_mentioned_entities('北理工有哪些学者？')[0][0], bit)
+        self.assertEqual(self.query.find_mentioned_entities('东北大学有哪些学者？')[0][0], neu)
+        result = self.query.ask('北理工有哪些学者？')
+        expected = {u for u in self.graph.subjects(ONTO.affiliatedWith, bit)
+                    if (u, RDF.type, ONTO.Scholar) in self.graph}
+        self.assertEqual(result['intent'], 'scholars_filtered')
+        self.assertEqual(result['count'], len(expected))
+        print('Public baseline BIT associated scholars:', len(expected))
+
 if __name__ == '__main__':
     unittest.main()
