@@ -44,5 +44,28 @@ class SemanticTests(unittest.TestCase):
         self.assertEqual(self.q.ask('你好！')['intent'], 'greeting')
         self.assertEqual(self.q.ask('Alice是谁？')['intent'], 'entity_detail')
 
+    def test_a3_publication_totals_and_intersection(self):
+        school = self.entity('fudan', 'Institution', 'Fudan University', country='CN')
+        field = self.entity('field', 'Field', 'Knowledge Graph', cnLabel='知识图谱')
+        a = self.entity('a', 'Scholar', 'Alice')
+        b = self.entity('b', 'Scholar', 'Bob')
+        for author in (a, b):
+            self.g.add((author, ONTO.affiliatedWith, school))
+        for i in range(35):
+            paper = self.entity('p' + str(i), 'Publication', 'Same title')
+            self.g.add((a, ONTO.authorOf, paper))
+            self.g.add((b, ONTO.authorOf, paper))
+            if i < 4:
+                self.g.add((paper, ONTO.belongsToField, field))
+        for question in ('复旦有哪些论文？', '复旦有多少论文？', 'Alice发表的论文列表'):
+            result = self.q.ask(question)
+            self.assertEqual(result['intent'], 'entity_publications')
+            self.assertEqual(result['count'], 35)
+            self.assertEqual(result['returned'], 30)
+            self.assertTrue(result['has_more'])
+            self.assertEqual(len({r['uri'] for r in result['data']}), 30)
+        result = self.q.ask('复旦知识图谱领域有哪些论文？')
+        self.assertEqual((result['count'], result['returned'], result['has_more']), (4, 4, False))
+
 if __name__ == '__main__':
     unittest.main()

@@ -221,6 +221,21 @@ class GenericSemanticQuery:
                 out.append({"name": str(t), "uri": s})
         return out[:limit]
 
+    def publications_for(self, entity):
+        """All typed publication URIs for a scholar, institution or field."""
+        kind = self._class_of(entity)
+        if kind == "Scholar":
+            candidates = set(self.g.objects(entity, ONTO.authorOf))
+        elif kind == "Institution":
+            candidates = {paper for author in self.g.subjects(ONTO.affiliatedWith, entity)
+                          if (author, RDF.type, ONTO.Scholar) in self.g
+                          for paper in self.g.objects(author, ONTO.authorOf)}
+        elif kind == "Field":
+            candidates = set(self.g.subjects(ONTO.belongsToField, entity))
+        else:
+            candidates = set()
+        return {paper for paper in candidates if (paper, RDF.type, ONTO.Publication) in self.g}
+
     # ---------- 智能入口 ----------
     def ask(self, question):
         """通用自然语言问数"""
@@ -256,6 +271,22 @@ class GenericSemanticQuery:
             data = self.year_distribution(fname)
             return {"intent": "trend", "field": fname or "全部论文", "data": data,
                     "total": sum(x["count"] for x in data)}
+
+        if "Publication" in cls_list and ents and not any(w in question for w in ("排名", "最多", "最高", "排行")):
+            scopes = [(uri, label) for uri, label in ents
+                      if self._class_of(uri) in ("Scholar", "Institution", "Field")]
+            if scopes:
+                papers = None
+                for uri, _ in scopes:
+                    scoped = self.publications_for(uri)
+                    papers = scoped if papers is None else papers & scoped
+                rows = [{"uri": str(uri), "id": str(uri).split("/")[-1], "name": self._label(uri),
+                         "properties": self._props_of(uri)} for uri in sorted(papers, key=str)]
+                top = rows[:30]
+                return {"intent": "entity_publications", "entity": " · ".join(label for _, label in scopes),
+                        "uri": str(scopes[0][0]), "count": len(rows), "data": top,
+                        "entities": [row["name"] for row in top], "returned": len(top),
+                        "has_more": len(rows) > len(top)}
 
         # 7) 某机构 + 某领域 的学者（返回带论文数的完整信息，而不是一串名字）
         if any(k in question for k in ("学者", "老师", "教授", "校友", "毕业生", "教师", "成员")) and ents:
