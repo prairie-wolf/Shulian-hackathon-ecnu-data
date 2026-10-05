@@ -78,24 +78,9 @@ class GenericSemanticQuery:
 
     # ---------- 匹配：找问题里提到的实体 ----------
     def find_mentioned_entities(self, question):
-        """在问题中查找提到的实体（按 name/cnLabel 匹配，2字以上）"""
-        hits = []
-        seen = set()
-        for s, p, o in self.g.triples((None, ONTO.name, None)):
-            lbl = str(o)
-            if len(lbl) >= 2 and lbl in question and s not in seen:
-                cls = self._class_of(s)
-                if cls != "Unknown":
-                    hits.append((s, lbl)); seen.add(s)
-        for s, p, o in self.g.triples((None, ONTO.cnLabel, None)):
-            lbl = str(o)
-            if len(lbl) >= 2 and lbl in question and s not in seen:
-                cls = self._class_of(s)
-                if cls != "Unknown":
-                    hits.append((s, lbl)); seen.add(s)
-        # 长名优先（避免"上海"盖过"上海交通大学"）
-        hits.sort(key=lambda x: -len(x[1]))
-        return hits
+        from aiplatform.entity_resolution import mentioned_entities
+        return [(u, label) for u, label in mentioned_entities(self.g, question)
+                if self._class_of(u) != "Unknown"]
 
     def find_mentioned_classes(self, question):
         """查找问题里提到的本体类（中英文）"""
@@ -407,6 +392,14 @@ class GenericSemanticQuery:
                 return {"intent": "search_publications", "keyword": kw,
                         "count": len(pubs), "entities": [p["name"] for p in pubs],
                         "data": pubs}
+
+        # A scoped question must never degrade to a whole-class listing.
+        generic = re.sub(r"有哪些|有什么|列出|所有|全部|清单|列表|多少|几个|哪些|平台|收录|请问|的|[？?。\s]", "", question)
+        for word in ("学者", "老师", "教授", "作者", "论文", "文献", "文章", "机构", "学校", "大学", "公司", "企业", "厂商", "行业", "产业", "领域", "方向", "学科", "期刊", "会议", "数据集", "资料集", "数据源"):
+            generic = generic.replace(word, "")
+        if cls_list and generic and not ents:
+            return {"intent": "not_found", "question": question, "count": 0,
+                    "data": [], "hint": "未找到问句中的实体或范围，请提供名称或标识。"}
 
         # 9) 按类列举
         if cls_list:
