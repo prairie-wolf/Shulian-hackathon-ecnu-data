@@ -51,7 +51,8 @@
 
 ### Git 提交与个人配置
 
-阶段性更新使用普通本地 commit，正文附简短 `Notes:`；提交时间戳和安全 hook 的启用与规则见 [Agent Git 操作检查](docs/agent-git-hook.md)。
+阶段性更新使用普通本地 commit，正文附简短 `Notes:`。
+Git hook 和 Codex hook 属于个人本地配置，其配置、辅助脚本、专用测试及说明均不纳入版本控制；项目成员可自行配置。
 
 `.gitignore` 排除本机 `ai_clients.json`、环境秘密、账号库、私人图、上传原件、
 虚拟环境、可重新生成的数据库/RDF/展示页，以及本地方案文档。

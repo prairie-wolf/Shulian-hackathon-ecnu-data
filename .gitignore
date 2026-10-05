@@ -46,8 +46,14 @@ htmlcov/
 /方案文档/
 
 # Local tooling, logs and temporary files
-/.codex/*
-!/.codex/hooks.json
+/.codex/
+/.githooks/
+/scripts/agent_git_guard.py
+/scripts/commit_timestamp.py
+/scripts/install_git_hooks.py
+/tests/test_agent_git_guard.py
+/tests/test_commit_timestamp.py
+/docs/agent-git-hook.md
 /.agents/
 /.aws/
 /.vscode/
