@@ -40,7 +40,7 @@ python -m aiplatform.gateway          # 默认 0.0.0.0:8610（同端口含人面
 | GET | `/openapi.json` | OpenAPI 3.1 机器契约（含工具 schema） |
 | GET | `/robots.txt` | 允许 AI 抓取，声明机面入口 |
 | GET | `/.well-known/mcp` | MCP 发现入口 |
-| GET | `/v1/mcp` | MCP 协议端点（工具列表） |
+| GET / POST / DELETE | `/v1/mcp` | MCP Streamable HTTP 端点（初始化及工具调用） |
 | GET | `/v1/models` | 列出平台「模型」（= 数据能力） |
 | GET | `/v1/tools` | 列出 8 个本体驱动工具（含 JSON Schema） |
 | POST | `/v1/tools/{tool}` | 直接调用工具 |
@@ -104,10 +104,10 @@ python aiplatform/mcp_server.py     # 本地 stdio（原有）
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `list_ontology` | — | 列出本体的类、关系、属性 |
+| `list_ontology` | — | 已入图的类及原始/消歧数量；完整本体见 `/v1/ontology` |
 | `list_sources` | — | 列出已接入的数据源 |
 | `explore_class` | `class_name`, `limit` | 浏览某个本体类的实例 |
-| `find_entity` | `class_name`, `keyword`, `limit` | 按关键词在类里查实体 |
+| `find_entity` | `class_name`, `keyword`, `limit`, `offset` | 按关键词在类里查实体，稳定排序分页 |
 | `entity_detail` | `entity_id` | 查看实体完整信息（属性+关系） |
 | `query_relation` | `subject_class`, `relation`, `object_class`, `limit` | 按关系跨类查询 |
 | `sparql` | `query` | 对统一知识图谱执行 SPARQL |
@@ -120,6 +120,17 @@ curl -X POST https://你的域名/v1/tools/semantic_ask \
   -H "Content-Type: application/json" \
   -d '{"arguments":{"question":"华东师范大学有哪些学者？"}}'
 ```
+
+`find_entity` 的 `limit` 默认为 10、须大于 0；`offset` 默认为 0、不能为负数，
+返回 `total`、`matches`、`has_more`。MCP 也支持这两个分页参数；
+MCP 的 `explore_class`、`query_relation` 目前使用默认展示上限，表中的自定义 `limit` 用于 REST。
+企业搜索、详情和关系查询复用有证据的等价视图，不按名称直接合并其他实体。
+`explore_class` 返回消歧后的 `instances` 与原始 `raw_instances`；原始 SPARQL 查询保持原图语义。
+SPARQL 更新被拒绝（REST 403 / MCP 工具错误）；ASK 返回 `boolean`，SELECT 返回表格结果。
+
+公共上传的目录与逐来源贡献在共享项目目录原子持久化；控制台、REST 和 MCP 在查询前刷新。
+私人上传不登记到公共目录。没有快照/溯源的历史原件不自动重新导入。
+本轮实际测试及存储恢复、旧私人目录迁移限制见 `项目更新日志.md`。
 
 ---
 

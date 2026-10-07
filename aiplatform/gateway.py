@@ -19,7 +19,7 @@
 运行：
   python -m aiplatform.gateway            # 默认 0.0.0.0:8610
 """
-import os, sys, json, time, uuid, copy
+import os, sys, json, time, uuid, copy, threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException, Request
@@ -35,6 +35,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 import anyio
 
 from aiplatform.build_platform import build
+from aiplatform.answers import summarize_result
 from aiplatform.semantic import GenericSemanticQuery
 from aiplatform.tools import PlatformTools, SPARQLReadOnlyError
 from aiplatform.core import ONTO_NS, RES_NS
@@ -151,17 +152,19 @@ async def add_request_id(request: Request, call_next):
 
 # ============ 平台初始化（进程内单例）============
 _onto = _cat = _graph = _q = _tools = None
+_platform_lock = threading.Lock()
 _client = None
 
 
 def get_platform():
     global _onto, _cat, _graph, _q, _tools
-    if _graph is None:
-        _onto, _cat, _graph = build()
-        _q = GenericSemanticQuery(_graph.g)
-        # PlatformTools 内部直接操作 rdflib Graph 方法(subjects/triples)，须传 _graph.g
-        _tools = PlatformTools(_graph.g, _cat)
-    return _onto, _cat, _graph, _q, _tools
+    with _platform_lock:
+        if _graph is None:
+            _onto, _cat, _graph = build()
+            # Keep the wrapper so tools can refresh shared upload state before reading.
+            _tools = PlatformTools(_graph, _cat)
+        _graph._public_store.refresh()
+        return _onto, _cat, _graph, GenericSemanticQuery(_graph.g), _tools
 
 
 def get_client():
@@ -558,7 +561,7 @@ TOOL_SPECS = [
     {"name": "list_ontology", "description": "列出平台本体的类、关系、属性", "parameters": {"type": "object", "properties": {}}},
     {"name": "list_sources", "description": "列出平台已接入的数据源", "parameters": {"type": "object", "properties": {}}},
     {"name": "explore_class", "description": "浏览某个本体类的实例", "parameters": {"type": "object", "properties": {"class_name": {"type": "string", "description": "本体类，如 Scholar/Publication/Company"}, "limit": {"type": "integer", "default": 5}}, "required": ["class_name"]}},
-    {"name": "find_entity", "description": "按关键词在某个类里查找实体", "parameters": {"type": "object", "properties": {"class_name": {"type": "string"}, "keyword": {"type": "string"}, "limit": {"type": "integer", "default": 10}}, "required": ["class_name", "keyword"]}},
+    {"name": "find_entity", "description": "按关键词在某个类里查找实体", "parameters": {"type": "object", "properties": {"class_name": {"type": "string"}, "keyword": {"type": "string"}, "limit": {"type": "integer", "default": 10}, "offset": {"type": "integer", "default": 0, "minimum": 0}}, "required": ["class_name", "keyword"]}},
     {"name": "entity_detail", "description": "查看某实体的完整信息（属性 + 关系）", "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}}, "required": ["entity_id"]}},
     {"name": "query_relation", "description": "按关系查询：某类的实体通过某关系指向另一类", "parameters": {"type": "object", "properties": {"subject_class": {"type": "string"}, "relation": {"type": "string"}, "object_class": {"type": "string"}, "limit": {"type": "integer", "default": 20}}, "required": ["subject_class", "relation", "object_class"]}},
     {"name": "sparql", "description": "对统一知识图谱执行 SPARQL 查询", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
@@ -817,7 +820,7 @@ def call_tool(tool_name: str, req: ToolCallRequest, request: Request):
         elif tool_name == "explore_class":
             result = tools.explore_class(args.get("class_name"), args.get("limit", 5))
         elif tool_name == "find_entity":
-            result = tools.find_entity(args.get("class_name"), args.get("keyword"), args.get("limit", 10))
+            result = tools.find_entity(args.get("class_name"), args.get("keyword"), args.get("limit", 10), args.get("offset", 0))
         elif tool_name == "entity_detail":
             result = tools.entity_detail(args.get("entity_id"))
         elif tool_name == "query_relation":
@@ -825,8 +828,7 @@ def call_tool(tool_name: str, req: ToolCallRequest, request: Request):
         elif tool_name == "sparql":
             result = tools.sparql(args.get("query"))
         elif tool_name == "semantic_ask":
-            # semantic_ask 内部期望 UnifiedGraph(.g)；这里已传 rdflib Graph，故直接走语义查询引擎
-            result = q.ask(args.get("question", ""))
+            result = tools.semantic_ask(args.get("question", ""))
         else:
             raise HTTPException(status_code=404, detail=problem(404, "not_found", f"未知工具 {tool_name}", "GET /v1/tools 查看工具清单"))
         return {"tool": tool_name, "result": result}
@@ -907,30 +909,7 @@ def _json_fit(obj, limit=3000):
 
 
 def _summarize(question, r):
-    it = r.get("intent")
-    if it == "relation_rank" and r.get("data"):
-        top = r["data"][:5]
-        return f"【平台查询结果】{r.get('subject')} 排名前 5：" + "、".join(f"{x['name']}({x['count']})" for x in top)
-    if it == "numeric_rank" and r.get("data"):
-        top = r["data"][:5]
-        return "【平台查询结果】数值排名前 5：" + "、".join(f"{x['name']}({x['value']})" for x in top)
-    if it == "industry_companies":
-        return f"【平台查询结果】{r.get('industry')} 行业共 {r.get('count')} 家公司：" + "、".join(x["name"] for x in r.get("companies", [])[:15])
-    if it == "field_entities":
-        return f"【平台查询结果】{r.get('field')} 领域共 {r.get('count')} 项：" + "；".join(str(x)[:50] for x in r.get("entities", [])[:8])
-    if it == "scholars_filtered":
-        return f"【平台查询结果】共 {r.get('count')} 位相关学者，前 15 位：" + "、".join(r.get("scholars", [])[:15])
-    if it == "institution_members":
-        return f"【平台查询结果】{r.get('institution')} 共 {r.get('count')} 位成员。"
-    if it == "list_class":
-        return f"【平台查询结果】{r.get('class')} 共 {r.get('count')} 个实例。"
-    if it == "search_entities":
-        return f"【平台查询结果】关键词「{r.get('keyword')}」命中 {r.get('count')} 个实体。"
-    if it == "overview":
-        return "【平台查询结果】平台本体实例分布：" + "、".join(f"{k}:{v}" for k, v in (r.get("classes") or {}).items())
-    if it == "entity_detail":
-        return f"【平台查询结果】{r.get('entity')}（{r.get('class')}）详情已返回。"
-    return "【平台查询结果】已返回结构化数据，详见 JSON。"
+    return summarize_result(question, r)
 
 
 # ============ 人面：反代 Streamlit ============

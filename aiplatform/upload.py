@@ -49,6 +49,10 @@ def remove_uploaded_source(graph, catalog, source_id):
     """Withdraw one upload's contribution, preserving all other sources."""
     if not source_id.startswith("ds_upload_"):
         raise ValueError("只能删除上传的公共数据源")
+    store = getattr(graph, "_public_store", None)
+    if store is not None:
+        return store.mutate(lambda working, cat: remove_uploaded_source(working, cat, source_id),
+                            source_to_remove=source_id)
     state = _source_state(graph.g)
     with state["lock"]:
         source = catalog.sources.get(source_id)
@@ -129,13 +133,17 @@ def _stable_id(text, mod=100000):
 
 def _make_unique(rows, key_col):
     """若主键重复或为空，生成唯一键"""
-    seen = {}
+    seen = set()
+    reserved = {str(r.get(key_col)) for r in rows
+                if r.get(key_col) is not None and str(r.get(key_col)).strip()}
     fixed = []
     for i, r in enumerate(rows):
         v = r.get(key_col)
         if v is None or str(v).strip() == "" or str(v) in seen:
             v = f"auto{i+1}"
-        seen[str(v)] = True
+            while v in seen or v in reserved:
+                v += "_"
+        seen.add(str(v))
         rr = dict(r); rr[key_col] = v
         fixed.append(rr)
     return fixed
@@ -144,6 +152,13 @@ def _make_unique(rows, key_col):
 def ingest_file(graph, catalog, path, filename=None, source_id=None, register=True,
                 allow_generic=True, skip_empty=True, max_rows=5000,
                 include_unmapped=False):
+    store = getattr(graph, "_public_store", None)
+    if store is not None:
+        if not register or (source_id is not None and not source_id.startswith("ds_upload_")):
+            raise ValueError("公共持久化上传必须登记独立的 ds_upload_ 来源")
+        return store.mutate(lambda working, cat: ingest_file(
+            working, cat, path, filename, source_id, register,
+            allow_generic, skip_empty, max_rows, include_unmapped))
     # Keep registration, all sheets, and deletion in one critical section.
     with _source_state(graph.g)["lock"]:
         return _ingest_file(graph, catalog, path, filename, source_id, register,
@@ -183,6 +198,8 @@ def _ingest_file(graph, catalog, path, filename=None, source_id=None, register=T
             sheets[f"table{i+1}"] = (t["header"], t["rows"])
 
     sid = source_id or f"ds_upload_{uuid.uuid4().hex}"
+    if register and sid in catalog.sources:
+        raise ValueError("数据源标识已存在，请为每次上传使用独立标识")
     report["source_id"] = sid
 
     if not sheets:

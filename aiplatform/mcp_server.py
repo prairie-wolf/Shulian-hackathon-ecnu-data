@@ -6,12 +6,13 @@ Claude / GPT / Gemini / Cursor / 各类 Agent 都能以同一套标准协议接�
 运行（stdio）：.venv/Scripts/python.exe aiplatform/mcp_server.py
 运行（HTTP）：.venv/Scripts/python.exe aiplatform/mcp_server.py --http --port 8602
 
-被统一网关复用：aiplatform/gateway.py 会调用 create_mcp_server()，把 MCP
-以 Streamable HTTP 挂到同一网关（/mcp），避免二次构建整图（省内存）。
+统一网关将 /v1/mcp 代理到独立 MCP HTTP 服务；各进程共享公共上传快照。
 """
 import os, sys, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from aiplatform.tools import SPARQLReadOnlyError
 
 
 def create_mcp_server(pt, catalog=None):
@@ -40,9 +41,9 @@ def create_mcp_server(pt, catalog=None):
         return pt.explore_class(class_name)
 
     @server.tool()
-    def find_entity(class_name: str, keyword: str) -> dict:
+    def find_entity(class_name: str, keyword: str, limit: int = 10, offset: int = 0) -> dict:
         """按名称搜索某类实体（跨中文标签，支持分页）"""
-        return pt.find_entity(class_name, keyword)
+        return pt.find_entity(class_name, keyword, limit, offset)
 
     @server.tool()
     def entity_detail(entity_id: str) -> dict:
@@ -57,7 +58,13 @@ def create_mcp_server(pt, catalog=None):
     @server.tool()
     def sparql(query: str) -> dict:
         """执行原始 SPARQL 查询（高级入口，跨全图）"""
-        return pt.sparql(query)
+        try:
+            result = pt.sparql(query)
+        except (SPARQLReadOnlyError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+        if "error" in result:
+            raise ToolError(result["error"])
+        return result
 
     @server.tool()
     def semantic_ask(question: str) -> dict:
@@ -74,7 +81,7 @@ if __name__ == "__main__":
     # 平台启动时构建一次（本体 + 数据接入 + 转化 + 统一图）
     print("正在构建平台实例...", file=sys.stderr)
     onto, catalog, graph = build()
-    pt = PlatformTools(graph.g)  # 注意：standalone 模式不传 catalog，list_sources 会退化
+    pt = PlatformTools(graph, catalog)
     mcp = create_mcp_server(pt, catalog)
     print("平台就绪。", file=sys.stderr)
 

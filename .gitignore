@@ -38,6 +38,8 @@ htmlcov/
 /data/processed/*.duckdb
 /data/processed/*.duckdb.*
 /data/processed/*.ttl
+/data/processed/upload_state.json
+/data/processed/upload_state.lock
 /app/console_data.json
 /app/static_console.html
 /app/showcase.html

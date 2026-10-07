@@ -79,6 +79,12 @@ class UploadLifecycleTests(unittest.TestCase):
         remove_uploaded_source(self.graph, self.catalog, result["source_id"])
         self.assertEqual(len(self.graph.g), 0)
 
+    def test_generated_duplicate_keys_do_not_collide_with_real_keys(self):
+        result, _ = self.upload(body="company_id,company_name\nDUP,first\nDUP,second\nauto2,third\n")
+        self.assertEqual(result["report"]["entities"], 3)
+        self.assertEqual(len(set(self.graph.g.subjects(RDF.type, ONTO.Company))), 3)
+        self.assertIn((RES.c_auto2, ONTO.name, Literal("third")), self.graph.g)
+
     def test_concurrent_deletions_preserve_preexisting_triples(self):
         base = (RES.c_C1, ONTO.name, Literal("ACME"))
         self.graph.g.add(base)

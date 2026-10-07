@@ -5,8 +5,30 @@
 这些工具会被 MCP server / REST / 本地智能体以同一套方式调用（AI 无关）。
 """
 import json, re
+from contextvars import ContextVar
+from functools import wraps
 from rdflib import RDF, URIRef, Literal, Namespace
 from aiplatform.core import ONTO_NS, RES_NS, ONTO, RES, RDFS
+from aiplatform.entity_equivalence import CompanyEquivalence
+
+
+def _read_snapshot(method):
+    @wraps(method)
+    def read(self, *args, **kwargs):
+        if self._view.get() is not None:
+            return method(self, *args, **kwargs)
+        store = getattr(self._graph, "_public_store", None)
+        if store is not None:
+            graph, sources = store.snapshot()
+        else:
+            graph = self.g
+            sources = dict(self._catalog.sources) if self._catalog is not None else {}
+        token = self._view.set((graph, sources, CompanyEquivalence(graph)))
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._view.reset(token)
+    return read
 
 
 class SPARQLReadOnlyError(Exception):
@@ -22,10 +44,22 @@ PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
 class PlatformTools:
     def __init__(self, graph, catalog=None):
-        self.g = graph
+        self._graph = graph
         self._catalog = catalog
+        self._view = ContextVar("platform_tool_view", default=None)
+
+    @property
+    def g(self):
+        view = self._view.get()
+        if view is not None:
+            return view[0]
+        store = getattr(self._graph, "_public_store", None)
+        if store is not None:
+            store.refresh()
+        return getattr(self._graph, "g", self._graph)
 
     # ---- 基础工具（本体驱动，通用）----
+    @_read_snapshot
     def list_ontology(self):
         """列出平台本体的类、对象属性、数据属性"""
         onto_g = self.g  # 这里传的是数据图，本体类从数据图 type 推断
@@ -34,54 +68,82 @@ class PlatformTools:
             if str(o).startswith(ONTO_NS):
                 c = str(o).split('#')[-1]
                 classes[c] = classes.get(c, 0) + 1
-        return {"ontology_classes": classes}
+        raw_classes = dict(classes)
+        if "Company" in classes:
+            classes["Company"] = len(self._entities("Company"))
+        return {"ontology_classes": classes, "raw_classes": raw_classes}
 
-    def list_sources(self, catalog):
+    @_read_snapshot
+    def list_sources(self, catalog=None):
         """列出已接入的数据源"""
+        self.g  # Refresh the graph and its catalog together.
+        catalog = catalog if catalog is not None else self._catalog
+        if catalog is None:
+            return {"sources": []}
+        sources = self._view.get()[1].values() if catalog is self._catalog else catalog.list()
         return {"sources": [{"id": s["source_id"], "name": s["name"],
-                             "kind": s["kind"], "rows": s["rows"]} for s in catalog.list()]}
+                             "kind": s["kind"], "rows": s["rows"]} for s in sources]}
+
+    def _entities(self, class_name):
+        cls = URIRef(class_name if str(class_name).startswith("http") else ONTO_NS + class_name)
+        entities = set(self.g.subjects(RDF.type, cls))
+        if cls == ONTO.Company:
+            view = self._equivalence()
+            entities = {view.representative(e) for e in entities}
+        return sorted(entities, key=str)
+
+    def _properties(self, entity):
+        return self._equivalence().predicate_objects(entity)
+
+    def _equivalence(self):
+        view = self._view.get()
+        return view[2] if view is not None else CompanyEquivalence(self.g)
 
     def _entity_name(self, e):
-        v = self.g.value(e, ONTO.name)
-        return str(v) if v else str(e).split('/')[-1]
+        names = sorted(str(o) for p, o in self._properties(e) if p == ONTO.name)
+        return names[0] if names else str(e).split('/')[-1]
 
+    @_read_snapshot
     def explore_class(self, class_name, limit=5):
         """探索某类实体：实例数 + 样例"""
-        cls = URIRef(ONTO_NS + class_name)
-        ents = list(self.g.subjects(RDF.type, cls))
+        cls = URIRef(class_name if str(class_name).startswith("http") else ONTO_NS + class_name)
+        ents = self._entities(class_name)
         samples = [self._entity_name(e) for e in ents[:limit]]
         return {"class": class_name, "instances": len(ents),
-                "samples": samples, "sample_count": len(samples)}
+                "samples": samples, "sample_count": len(samples),
+                "raw_instances": len(set(self.g.subjects(RDF.type, cls)))}
 
+    @_read_snapshot
     def find_entity(self, class_name, keyword, limit=10, offset=0):
-            """按名称搜索某类实体（支持分页 offset）。同时匹配 name 与 cnLabel（中文标签），大小写不敏感。"""
-            cls = URIRef(ONTO_NS + class_name) if not str(class_name).startswith("http") else URIRef(class_name)
-            kw = (keyword or "").lower()
-            out = []
-            for e in self.g.subjects(RDF.type, cls):
-                nm = self._entity_name(e)
-                cn = self.g.value(e, ONTO.cnLabel)
-                hit = kw in nm.lower()
-                if not hit and cn is not None:
-                    hit = kw in str(cn).lower()
-                if hit:
-                    out.append({"id": str(e).split('/')[-1], "name": nm,
-                                "cnName": str(cn) if cn is not None else ""})
-            page = out[offset:offset + limit]
-            return {"class": class_name, "keyword": keyword, "matches": page,
-                    "total": len(out), "offset": offset, "limit": limit,
-                    "has_more": (offset + len(page)) < len(out)}
+        """Search canonical entities through all evidenced names, with stable pagination."""
+        if limit < 1 or offset < 0:
+            raise ValueError("limit 必须为正整数，offset 不能为负数")
+        kw = (keyword or "").lower()
+        out = []
+        for e in self._entities(class_name):
+            labels = [(p, str(o)) for p, o in self._properties(e) if p in (ONTO.name, ONTO.cnLabel)]
+            if any(kw in value.lower() for _, value in labels):
+                cn = sorted(value for p, value in labels if p == ONTO.cnLabel)
+                out.append({"id": str(e).split('/')[-1], "name": self._entity_name(e),
+                            "cnName": "、".join(cn)})
+        page = out[offset:offset + limit]
+        return {"class": class_name, "keyword": keyword, "matches": page,
+                "total": len(out), "offset": offset, "limit": limit,
+                "has_more": offset + len(page) < len(out)}
 
+    @_read_snapshot
     def search_cross_class(self, keyword, limit=20):
         """跨类检索：在全部分类的 name/cnLabel 中模糊匹配，返回带类别与 id。"""
         kw = (keyword or "").lower()
         out, seen = [], set()
-        for e in self.g.subjects(RDF.type, None):
+        view = self._equivalence()
+        for e in sorted({view.representative(e) for e in self.g.subjects(RDF.type, None)}, key=str):
             if e in seen:
                 continue
             nm = self._entity_name(e)
-            cn = self.g.value(e, ONTO.cnLabel)
-            hit = kw in nm.lower() or (cn is not None and kw in str(cn).lower())
+            labels = [(p, str(o)) for p, o in self._properties(e) if p in (ONTO.name, ONTO.cnLabel)]
+            cn = "、".join(sorted(v for p, v in labels if p == ONTO.cnLabel))
+            hit = any(kw in v.lower() for _, v in labels)
             if not hit:
                 continue
             seen.add(e)
@@ -97,11 +159,12 @@ class PlatformTools:
                 break
         return out
 
+    @_read_snapshot
     def entity_detail(self, entity_id):
         """实体的全部属性与关系"""
         e = RES[entity_id]
         props, rels = [], []
-        for p, o in self.g.predicate_objects(e):
+        for p, o in self._properties(e):
             pl = str(p).split('#')[-1]
             if isinstance(o, Literal):
                 props.append({"property": pl, "value": str(o)})
@@ -109,30 +172,43 @@ class PlatformTools:
                 rels.append({"relation": pl, "target": self._entity_name(o), "target_id": str(o).split('/')[-1]})
         return {"entity": entity_id, "name": self._entity_name(e), "properties": props, "relations": rels}
 
+    @_read_snapshot
     def query_relation(self, subject_class, relation, object_class, limit=20):
         """查询某类关系 (subject_class -relation-> object_class)"""
         s_cls = URIRef(ONTO_NS + subject_class)
         o_cls = URIRef(ONTO_NS + object_class)
         pred = URIRef(ONTO_NS + relation)
         out = []
-        for s, o in self.g.subject_objects(pred):
+        view = self._equivalence()
+        pairs = {(view.representative(s), view.representative(o)) for s, o in self.g.subject_objects(pred)}
+        for s, o in sorted(pairs, key=lambda pair: tuple(map(str, pair))):
             if (s, RDF.type, s_cls) in self.g and (o, RDF.type, o_cls) in self.g:
                 out.append({"subject": self._entity_name(s), "object": self._entity_name(o)})
         return {"relation": f"{subject_class} -{relation}-> {object_class}", "count": len(out), "pairs": out[:limit]}
 
+    @_read_snapshot
     def sparql(self, query):
         """执行原始 SPARQL（高级入口）。只读白名单：拒绝写操作（INSERT/DELETE/DROP/LOAD/CLEAR）。
         拒绝时抛 SPARQLReadOnlyError（上层转 403 problem+json）——不能用 200 承载错误。"""
-        banned = ["insert", "delete", "drop ", "load ", "clear ", "create ", "copy ", "move "]
-        ql = (" " + query + " ").lower()
-        for b in banned:
-            if b in ("delete", "drop ", "load ", "clear ", "create ", "copy ", "move "):
-                if (" " + b.rstrip() in ql) or (b.strip() in ql and "\n" + b.strip() in ql):
-                    raise SPARQLReadOnlyError(f"拒绝：SPARQL 只读，不允许写操作（{b.strip()}）。")
-            elif b in ql:
-                raise SPARQLReadOnlyError("拒绝：SPARQL 只读，不允许 INSERT。")
+        from rdflib.plugins.sparql.parser import parseQuery, parseUpdate
         try:
-            rows = list(self.g.query(PREFIXES + query))
+            parseQuery(PREFIXES + query)
+        except Exception as query_error:
+            try:
+                parsed = parseUpdate(PREFIXES + query)
+                if not parsed.get("request"):
+                    raise ValueError("不是 SPARQL 更新")
+            except Exception:
+                raise ValueError("无效的 SPARQL 查询") from query_error
+            raise SPARQLReadOnlyError("拒绝：SPARQL 只读，不允许更新数据。")
+        try:
+            result = self.g.query(PREFIXES + query)
+            if result.type == "ASK":
+                return {"boolean": bool(result), "count": 1}
+            if result.type in ("CONSTRUCT", "DESCRIBE"):
+                triples = [[str(n) for n in t] for t in result.graph]
+                return {"columns": ["subject", "predicate", "object"], "rows": triples, "count": len(triples)}
+            rows = list(result)
             if not rows:
                 return {"rows": [], "count": 0}
             vars_ = [str(v) for v in rows[0].labels] if rows[0].labels else []
@@ -145,17 +221,19 @@ class PlatformTools:
             return {"error": str(e)}
 
     # ---- 语义查询（自然语言 -> 工具，供智能体调用）----
+    @_read_snapshot
     def semantic_ask(self, question, llm_parse=None):
         """自然语言问数入口。走通用语义查询引擎（本体驱动，非写死关键词）。
         llm_parse 可选：外部 LLM 提供的解析结果（当前版本直接走引擎）"""
         from aiplatform.semantic import GenericSemanticQuery
         q = question
         if "数据源" in q and ("哪些" in q or "列出" in q):
+            sources = [s["name"] for s in self.list_sources()["sources"]]
             return {"intent": "list_sources",
-                    "sources": [s["name"] for s in self._catalog.list()] if getattr(self, "_catalog", None) else []}
+                    "sources": sources, "count": len(sources)}
         if "本体" in q and ("哪些" in q or "列出" in q or "结构" in q):
             return self.list_ontology()
-        return GenericSemanticQuery(self.g.g).ask(question)
+        return GenericSemanticQuery(self.g).ask(question)
 
     def _all_industry_names(self):
         out = []

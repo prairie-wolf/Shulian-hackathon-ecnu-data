@@ -6,6 +6,12 @@
 import os, sys, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aiplatform.core import PlatformOntology, SourceCatalog, UnifiedGraph
+from aiplatform.public_state import PublicUploadStore
+from aiplatform.entity_equivalence import link_company_equivalences
+
+
+def _log(*args):
+    print(*args, file=sys.stderr)
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROC = os.path.join(BASE, "data", "processed")
@@ -13,10 +19,10 @@ RAW = os.path.join(BASE, "data", "raw")
 
 def build():
     onto = PlatformOntology(os.path.join(BASE, "ontology", "platform.owl"))
-    print("== 本体加载 ==")
-    print("  类:", onto.classes)
-    print("  对象属性:", onto.object_props)
-    print("  数据属性:", onto.data_props)
+    _log("== 本体加载 ==")
+    _log("  类:", onto.classes)
+    _log("  对象属性:", onto.object_props)
+    _log("  数据属性:", onto.data_props)
 
     cat = SourceCatalog()
     # 数据源注册表（来源文件 -> source_id）
@@ -43,27 +49,31 @@ def build():
         "ds_companies_v2": ("44 家上市公司", os.path.join(RAW, "companies_v2.csv")),
             }
 
-    mappings = json.load(open(os.path.join(BASE, "mappings.json"), encoding="utf-8"))
+    with open(os.path.join(BASE, "mappings.json"), encoding="utf-8") as stream:
+        mappings = json.load(stream)
 
     graph = UnifiedGraph(onto)
-    print("\n== 数据接入 + 本体性转化 ==")
+    _log("\n== 数据接入 + 本体性转化 ==")
     total_triples = 0
     for sid, (name, loc) in sources.items():
         cat.register(sid, name, loc)
         res = graph.ingest(cat, mappings.get(sid, []), sid)
         total_triples += res["triples_added"]
-        print(f"  {name}: {res['rows']} 行 -> {res['triples_added']} 三元组")
+        _log(f"  {name}: {res['rows']} 行 -> {res['triples_added']} 三元组")
 
-    print(f"\n== 统一语义图 ==")
+    link_company_equivalences(graph.g)
+    store = PublicUploadStore(graph, cat, os.path.join(PROC, "upload_state.json"))
+
+    _log(f"\n== 统一语义图 ==")
     stats = graph.stats()
-    print(f"  总三元组: {stats['triples']}")
-    print(f"  总实体: {stats['entities']}")
+    _log(f"  总三元组: {stats['triples']}")
+    _log(f"  总实体: {stats['entities']}")
     for c, n in sorted(stats["classes"].items()):
-        print(f"    {c}: {n}")
+        _log(f"    {c}: {n}")
 
     out = os.path.join(PROC, "platform_graph.ttl")
-    graph.g.serialize(destination=out, format="turtle")
-    print(f"\n统一图已保存: {out}")
+    store.export(out)
+    _log(f"\n统一图已保存: {out}")
     return onto, cat, graph
 
 if __name__ == "__main__":

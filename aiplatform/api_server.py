@@ -15,7 +15,7 @@
 启动：
   python -m aiplatform.api_server            # 默认 0.0.0.0:8610
 """
-import os, sys, json, time, uuid
+import os, sys, json, time, uuid, threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException, Request
@@ -24,8 +24,9 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
 from aiplatform.build_platform import build
+from aiplatform.answers import summarize_result
 from aiplatform.semantic import GenericSemanticQuery
-from aiplatform.tools import PlatformTools
+from aiplatform.tools import PlatformTools, SPARQLReadOnlyError
 
 app = FastAPI(title="面向 AI 的大数据平台 · OpenAI 兼容端点",
               description="把本体化数据能力暴露为标准 OpenAI 接口，任何 AI 客户端可接入",
@@ -36,15 +37,17 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
 
 # ---------- 平台初始化（进程内单例）----------
 _onto = _cat = _graph = _q = _tools = None
+_platform_lock = threading.Lock()
 
 
 def get_platform():
     global _onto, _cat, _graph, _q, _tools
-    if _graph is None:
-        _onto, _cat, _graph = build()
-        _q = GenericSemanticQuery(_graph.g)
-        _tools = PlatformTools(_graph, _cat)
-    return _onto, _cat, _graph, _q, _tools
+    with _platform_lock:
+        if _graph is None:
+            _onto, _cat, _graph = build()
+            _tools = PlatformTools(_graph, _cat)
+        _graph._public_store.refresh()
+        return _onto, _cat, _graph, GenericSemanticQuery(_graph.g), _tools
 
 
 # ---------- 平台工具清单（本体驱动，供任意 Agent 调用）----------
@@ -60,7 +63,7 @@ TOOL_SPECS = [
     {"name": "find_entity", "description": "按关键词在某个类里查找实体",
      "parameters": {"type": "object", "properties": {
          "class_name": {"type": "string"}, "keyword": {"type": "string"},
-         "limit": {"type": "integer", "default": 10}}, "required": ["class_name", "keyword"]}},
+         "limit": {"type": "integer", "default": 10}, "offset": {"type": "integer", "default": 0, "minimum": 0}}, "required": ["class_name", "keyword"]}},
     {"name": "entity_detail", "description": "查看某实体的完整信息（属性 + 关系）",
      "parameters": {"type": "object", "properties": {
          "entity_id": {"type": "string"}}, "required": ["entity_id"]}},
@@ -141,7 +144,7 @@ def call_tool(tool_name: str, req: ToolCallRequest):
             result = tools.explore_class(args.get("class_name"), args.get("limit", 5))
         elif tool_name == "find_entity":
             result = tools.find_entity(args.get("class_name"), args.get("keyword"),
-                                       args.get("limit", 10))
+                                       args.get("limit", 10), args.get("offset", 0))
         elif tool_name == "entity_detail":
             result = tools.entity_detail(args.get("entity_id"))
         elif tool_name == "query_relation":
@@ -154,6 +157,8 @@ def call_tool(tool_name: str, req: ToolCallRequest):
         else:
             raise HTTPException(status_code=404, detail=f"未知工具 {tool_name}")
         return {"tool": tool_name, "result": result}
+    except SPARQLReadOnlyError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except HTTPException:
         raise
     except Exception as e:
@@ -182,7 +187,7 @@ def chat_completions(req: ChatRequest):
 
     # 组织成 OpenAI 兼容的回答：先自然语言摘要，再附结构化数据
     summary = _summarize(question, result)
-    content = summary + "\n\n```json\n" + json.dumps(result, ensure_ascii=False, indent=1)[:3000] + "\n```"
+    content = summary + "\n\n```json\n" + json.dumps(result, ensure_ascii=False, indent=1) + "\n```"
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -201,37 +206,7 @@ def chat_completions(req: ChatRequest):
 
 
 def _summarize(question, r):
-    """把结构化查询结果转成简短中文摘要（外部 AI 可再加工）"""
-    it = r.get("intent")
-    if it == "relation_rank" and r.get("data"):
-        top = r["data"][:5]
-        return f"【平台查询结果】{r.get('subject')} 排名前 5：" + \
-               "、".join(f"{x['name']}({x['count']})" for x in top)
-    if it == "numeric_rank" and r.get("data"):
-        top = r["data"][:5]
-        return "【平台查询结果】数值排名前 5：" + \
-               "、".join(f"{x['name']}({x['value']})" for x in top)
-    if it == "industry_companies":
-        return f"【平台查询结果】{r.get('industry')} 行业共 {r.get('count')} 家公司：" + \
-               "、".join(x["name"] for x in r.get("companies", [])[:15])
-    if it == "field_entities":
-        return f"【平台查询结果】{r.get('field')} 领域共 {r.get('count')} 项：" + \
-               "；".join(str(x)[:50] for x in r.get("entities", [])[:8])
-    if it == "scholars_filtered":
-        return f"【平台查询结果】共 {r.get('count')} 位相关学者，前 15 位：" + \
-               "、".join(r.get("scholars", [])[:15])
-    if it == "institution_members":
-        return f"【平台查询结果】{r.get('institution')} 共 {r.get('count')} 位成员。"
-    if it == "list_class":
-        return f"【平台查询结果】{r.get('class')} 共 {r.get('count')} 个实例。"
-    if it == "search_entities":
-        return f"【平台查询结果】关键词「{r.get('keyword')}」命中 {r.get('count')} 个实体。"
-    if it == "overview":
-        return "【平台查询结果】平台本体实例分布：" + \
-               "、".join(f"{k}:{v}" for k, v in (r.get("classes") or {}).items())
-    if it == "entity_detail":
-        return f"【平台查询结果】{r.get('entity')}（{r.get('class')}）详情已返回。"
-    return "【平台查询结果】已返回结构化数据，详见 JSON。"
+    return summarize_result(question, r)
 
 
 if __name__ == "__main__":

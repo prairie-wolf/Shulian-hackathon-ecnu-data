@@ -9,16 +9,16 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER = os.path.join(BASE, "platform", "mcp_server.py")
+SERVER = os.path.join(BASE, "aiplatform", "mcp_server.py")
 
 async def main():
     params = StdioServerParameters(command=sys.executable, args=[SERVER], cwd=BASE)
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
-            await session.initialize()
-            info = session.server_info
+            initialized = await session.initialize()
+            info = initialized.server_info
             print(f"== 已连接平台: {info.name} ==")
-            print(f"   说明: {session.instructions[:80] if session.instructions else ''}...")
+            print(f"   说明: {(initialized.instructions or '')[:80]}...")
 
             tools = await session.list_tools()
             print(f"\n== 平台暴露 {len(tools.tools)} 个工具（任何 AI 都可用）==")
@@ -35,6 +35,8 @@ async def main():
 
 def _print_result(r):
     # mcp 2.x ToolResult：尝试多个字段
+    if r.is_error:
+        raise RuntimeError(f"MCP 工具调用失败：{r.content}")
     data = None
     if hasattr(r, "structured_content") and r.structured_content:
         data = r.structured_content

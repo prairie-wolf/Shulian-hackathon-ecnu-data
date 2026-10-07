@@ -34,6 +34,7 @@ from app.ui_kit import (
     tag,
 )
 from aiplatform import privates
+from aiplatform.answers import answer_with_client
 from aiplatform.ai_clients import PRESETS, call_client, list_clients, register_client
 from aiplatform.build_platform import build
 from aiplatform.semantic import GenericSemanticQuery
@@ -65,6 +66,7 @@ def init_platform():
 
 
 onto, cat, graph = init_platform()
+graph._public_store.refresh()
 
 
 def _stable_hash(text: str, mod: int = 100000) -> int:
@@ -105,17 +107,25 @@ _USERS = _load_users()
 def _rebuild_query() -> None:
     uid = st.session_state.get("uid")
     if uid:
-        data_dir, user_graph = privates.load_user_priv(uid)
+        try:
+            data_dir, user_graph = privates.load_user_priv(uid)
+        except (OSError, ValueError, RuntimeError) as exc:
+            st.session_state["gq"] = None
+            st.session_state["query_error"] = str(exc)
+            return
         st.session_state["priv_dir"] = data_dir
         st.session_state["gq"] = GenericSemanticQuery(privates.merge_public_user(graph.g, user_graph))
     else:
         st.session_state.pop("priv_dir", None)
         st.session_state["gq"] = GenericSemanticQuery(graph.g)
+    st.session_state.pop("query_error", None)
 
 
 def current_query() -> GenericSemanticQuery:
-    if "gq" not in st.session_state:
-        _rebuild_query()
+    graph._public_store.refresh()
+    _rebuild_query()
+    if st.session_state.get("query_error"):
+        raise ValueError(st.session_state["query_error"])
     return st.session_state["gq"]
 
 
@@ -148,14 +158,20 @@ def login_widget() -> bool:
     if st.session_state.get("uid"):
         uid = st.session_state.uid
         role = st.session_state.get("role", "user")
-        _d, pg = privates.load_user_priv(uid)
+        try:
+            _d, pg = privates.load_user_priv(uid)
+            private_summary = f"私有三元组 {len(pg):,}"
+            st.session_state.pop("query_error", None)
+        except (OSError, ValueError, RuntimeError) as exc:
+            private_summary = "私人数据暂不可用"
+            st.session_state["query_error"] = str(exc)
         st.markdown(
-            f'<div class="panel-soft"><b>{uid}</b> · {role}<br>'
-            f'<span class="stCaption">私有三元组 {len(pg):,}</span></div>',
+            f'<div class="panel-soft"><b>{esc(uid)}</b> · {esc(role)}<br>'
+            f'<span class="stCaption">{private_summary}</span></div>',
             unsafe_allow_html=True,
         )
         if st.button("退出登录", width="stretch"):
-            for key in ("uid", "role", "gq", "priv_dir", "view_priv"):
+            for key in ("uid", "role", "gq", "priv_dir", "view_priv", "query_error"):
                 st.session_state.pop(key, None)
             st.rerun()
         return True
@@ -194,6 +210,8 @@ def _sidebar(stats: dict) -> None:
     with st.container(key="side_rail"):
         st.markdown(brand_block(), unsafe_allow_html=True)
         login_widget()
+        if st.session_state.get("query_error"):
+            st.error(st.session_state["query_error"])
         st.divider()
         st.markdown('<div class="nav-caption">控制台</div>', unsafe_allow_html=True)
         current = st.session_state.get("nav", NAV_ITEMS[0])
@@ -298,14 +316,14 @@ def _handle_upload(uploaded, allow_generic=False, skip_empty=True,
         try:
             if uid:
                 partition = st.session_state.get("cur_partition", "user_0")
-                priv_graph = privates.load_partition_g(uid, partition)
-                proxy = privates.UserGraphProxy(onto, priv_graph)
-                source_id = f"priv_{privates.safe_uid(uid)}_{partition}_{_stable_hash(display_name, 10000)}"
-                report = ingest_file(proxy, cat, tmp_path, display_name, source_id=source_id,
-                                     allow_generic=allow_generic, skip_empty=skip_empty,
-                                     max_rows=int(max_rows), include_unmapped=include_unmapped)
-                if not report.get("error"):
-                    privates.save_partition(uid, partition, priv_graph)
+                # Private sources must never enter the shared public catalog.
+                from aiplatform.core import SourceCatalog
+                with privates.edit_partition(uid, partition) as priv_graph:
+                    proxy = privates.UserGraphProxy(onto, priv_graph)
+                    source_id = f"priv_{privates.safe_uid(uid)}_{partition}_{uuid.uuid4().hex}"
+                    report = ingest_file(proxy, SourceCatalog(), tmp_path, display_name, source_id=source_id,
+                                         allow_generic=allow_generic, skip_empty=skip_empty,
+                                         max_rows=int(max_rows), include_unmapped=include_unmapped)
                 _rebuild_query()
             else:
                 source_id = f"ds_upload_{uuid.uuid4().hex}"
@@ -408,7 +426,11 @@ def render_data() -> None:
     if logged:
         section_title("私人库", "上传到私人分区的数据只参与当前账户的语义查询")
         uid = st.session_state.uid
-        parts = privates.list_partitions(uid)
+        try:
+            parts = privates.list_partitions(uid)
+        except (OSError, ValueError) as exc:
+            st.error(str(exc))
+            return
         col1, col2 = st.columns([1, 2], gap="large")
         with col1:
             selected = st.selectbox(
@@ -421,8 +443,12 @@ def render_data() -> None:
             new_name = st.text_input("新建分区", placeholder="例如：项目A / 竞品调研")
             if st.button("创建分区", width="stretch"):
                 if new_name.strip():
-                    st.session_state.cur_partition = privates.new_partition(uid, new_name.strip())
-                    st.rerun()
+                    try:
+                        st.session_state.cur_partition = privates.new_partition(uid, new_name.strip())
+                    except (OSError, ValueError) as exc:
+                        st.error(f"创建失败：{exc}")
+                    else:
+                        st.rerun()
                 else:
                     st.warning("请输入分区名称")
             st.divider()
@@ -431,13 +457,16 @@ def render_data() -> None:
                 if confirm_delete:
                     try:
                         _delete_private_partition(uid, selected)
-                    except OSError as exc:
+                    except (OSError, ValueError) as exc:
                         st.error(f"删除失败：{exc}")
                     else:
                         st.rerun()
                 else:
                     st.warning("请先勾选确认删除。")
         with col2:
+            for partition in parts:
+                if partition.get("error"):
+                    st.error(partition["error"])
             st.dataframe(pd.DataFrame([{"分区": p["name"], "标识": p["id"], "三元组": p["triples"]}
                                        for p in parts]), width="stretch", hide_index=True)
     else:
@@ -477,107 +506,8 @@ def _render_result(result: dict) -> None:
         st.json(result)
 
 
-def _extract_names(result: dict) -> list[str]:
-    names: list[str] = []
-    seen: set[str] = set()
-    keys = ("scholars", "companies", "entities", "samples", "members",
-            "collaborators", "ranking", "sources", "matches")
-    for key in keys:
-        for item in result.get(key) or []:
-            if isinstance(item, str):
-                text = item
-            elif isinstance(item, dict):
-                text = item.get("name") or item.get("en_name") or item.get("member") or item.get("title") or ""
-            else:
-                text = str(item)
-            text = str(text).strip()
-            if text and text not in seen:
-                seen.add(text)
-                names.append(text)
-                if len(names) >= 15:
-                    return names
-    for item in result.get("data") or []:
-        if isinstance(item, dict) and item.get("name"):
-            text = str(item["name"]).strip()
-            if text and text not in seen:
-                seen.add(text)
-                names.append(text)
-                if len(names) >= 15:
-                    return names
-    return names
-
-
-def _humanize_result(question: str, result: dict) -> str:
-    apology = ("抱歉，根据本平台当前已接入的数据，我暂时没找到可回答这项问题的记录。"
-               "你可以换成更明确的平台数据问题试试，例如：“华东师范大学有哪些学者？”、"
-               "“大语言模型趋势”、“物流快递行业有哪些公司？”。")
-    if not isinstance(result, dict):
-        return apology
-    intent = result.get("intent", "unknown")
-    if result.get("error"):
-        return "抱歉，根据本平台当前已接入的数据，这次查询没有拿到可用结果。你可以换个问法，或稍后再试。"
-    if intent in ("unknown", "none", "unsupported"):
-        return apology
-    if intent == "entity_detail":
-        props = result.get("properties") or {}
-        props_text = "、".join(f"{k}：{v}" for k, v in list(props.items())[:8])
-        if props_text:
-            return f"根据本平台已接入的数据，已查到“{result.get('entity', '该实体')}”的详情：{props_text}。"
-        return apology
-    if intent == "overview":
-        overview_terms = ("平台", "数据", "本体", "概览", "总览", "覆盖", "规模", "统计", "有哪些类", "多少")
-        if not any(term in question for term in overview_terms):
-            return apology
-        classes = result.get("classes") or {}
-        if classes:
-            summary = "、".join(f"{k} {v} 个" for k, v in list(classes.items())[:12])
-            return f"根据本平台已接入的数据，平台当前覆盖 {len(classes)} 类数据：{summary}。"
-        return apology
-    names = _extract_names(result)
-    if names:
-        count = int(result.get("count") or result.get("total") or len(names))
-        label = {
-            "scholars_filtered": "学者",
-            "scholars": "学者",
-            "institution_members": "学者",
-            "industry_companies": "公司",
-            "companies_in_industry": "公司",
-            "field_entities": "条目",
-            "relation_rank": "排名",
-            "numeric_rank": "排名",
-            "year_distribution": "年度记录",
-            "trend": "年度记录",
-            "search_entities": "实体",
-            "list_class": "实例",
-            "cls_list": "实例",
-            "list_sources": "数据源",
-        }.get(intent, "结果")
-        return f"根据本平台已接入的数据，这个问题共查到 {count} 条{label}相关数据，主要结果：{'、'.join(names)}。"
-    if intent == "trend" or intent == "year_distribution":
-        rows = result.get("data") or []
-        if rows:
-            total = sum(int(x.get("count") or 0) for x in rows if isinstance(x, dict))
-            return f"根据本平台已接入的数据，已统计 {len(rows)} 个时间点，累计 {total} 条记录。也可以看右侧趋势图。"
-    return apology
-
-
 def _answer_with_ai(question: str, picked: dict) -> tuple[dict, list[dict], str]:
-    result = current_query().ask(question)
-    intent = result.get("intent", "unknown")
-    trace = [{"step": "本体语义查询", "intent": intent,
-              "preview": json.dumps(result, ensure_ascii=False)[:260]}]
-    if picked["kind"] in ("local", "platform"):
-        answer = _humanize_result(question, result)
-        trace.append({"step": "平台引擎返回结构化结果，并生成人话摘要"})
-        return result, trace, answer
-    response = call_client(picked["key"], [
-        {"role": "system", "content": "你是平台内数据问答助手。只能依据【平台查询结果】中本平台已接入的数据作答，用简洁中文回答，不得使用平台外知识，不得编造。平台没有记录时必须明确回答“根据本平台当前已接入的数据，暂未收录该数据”。"},
-        {"role": "user", "content": f"用户问题：{question}\n\n平台查询结果：\n{json.dumps(result, ensure_ascii=False)}"},
-    ], timeout=180)
-    answer = response.get("content") or _humanize_result(question, result)
-    trace.append({"step": "AI 生成答案", "backend": response.get("backend"),
-                  "elapsed_ms": response.get("elapsed_ms"), "error": response.get("error")})
-    return result, trace, answer
+    return answer_with_client(question, current_query().ask(question), picked, call_client)
 
 
 def _scroll_to_latest() -> None:
@@ -599,7 +529,8 @@ setTimeout(() => {
 def render_chat() -> None:
     page_header("语义问答", "自然语言问题会先进入本体语义层，再交给选定 AI 生成可核验答案。", "语义引擎就绪")
     clients = list_clients()
-    labels = ["— 选择 AI —"] + [c["name"] for c in clients]
+    clients.sort(key=lambda c: c["kind"] != "local")
+    labels = [c["name"] for c in clients]
     picked_name = st.selectbox("驱动 AI", labels, index=0, key="chat_ai", label_visibility="collapsed")
     picked = next((c for c in clients if c["name"] == picked_name), None)
     if picked is None:
@@ -648,10 +579,16 @@ def render_chat() -> None:
                 st.markdown(question)
             with st.chat_message("assistant"):
                 with st.spinner("正在执行本体语义查询 ..."):
-                    result, trace, answer = _answer_with_ai(question, picked)
+                    try:
+                        result, trace, answer = _answer_with_ai(question, picked)
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        result = {"error": str(exc)}
+                        trace = [{"step": "数据校验失败", "answer_source": "本地存储校验"}]
+                        answer = f"当前数据无法用于查询：{exc}"
                 st.markdown(answer)
-                st.caption(f"{picked['name']} · {picked.get('model', '')}")
-            st.session_state.messages.append({"role": "assistant", "content": answer, "meta": picked["name"]})
+                answer_source = trace[-1].get("answer_source", picked["name"])
+                st.caption(answer_source)
+            st.session_state.messages.append({"role": "assistant", "content": answer, "meta": answer_source})
             st.session_state.last = {"trace": trace, "result": result, "question": question, "picked": picked}
             st.session_state["scroll_to_chat"] = True
         _scroll_to_latest()
