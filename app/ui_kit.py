@@ -112,8 +112,18 @@ a{color:var(--teal)!important;text-decoration:none!important}
 .stButton>button{border-radius:7px!important;border:1px solid #d0d5dd!important;background:#fff!important;color:#344054!important;font-weight:650!important;box-shadow:var(--shadow)!important;min-height:38px}
 .stButton>button:hover{border-color:#98a2b3!important;background:#f9fafb!important}
 .stButton>button[kind="primary"]{background:var(--teal)!important;border-color:var(--teal)!important;color:#fff!important}
-.stTextInput input,.stTextArea textarea,.stSelectbox div[data-baseweb="select"]>div{background:#fff!important;border-radius:7px!important;border-color:#d0d5dd!important}
-.stTextInput input:focus,.stTextArea textarea:focus{border-color:var(--teal)!important;box-shadow:0 0 0 3px rgba(15,118,110,.12)!important}
+.stTextInput input,.stTextArea textarea,.stNumberInput input,
+.stSelectbox div[data-baseweb="select"]>div,.stChatInput textarea{
+  background:#fff!important;border-radius:7px!important;border-color:#d0d5dd!important;
+  color:#101828!important;-webkit-text-fill-color:#101828!important;caret-color:#101828!important
+}
+.stTextInput input::placeholder,.stTextArea textarea::placeholder,.stChatInput textarea::placeholder{
+  color:#98a2b3!important;-webkit-text-fill-color:#98a2b3!important;opacity:1!important
+}
+.stSelectbox div[data-baseweb="select"] *{color:#101828!important}
+.stTextInput input:focus,.stTextArea textarea:focus,.stNumberInput input:focus,
+.stChatInput textarea:focus{border-color:var(--teal)!important;box-shadow:0 0 0 3px rgba(15,118,110,.12)!important}
+[data-testid="stChatInput"]{background:#fff!important;border:1px solid #d0d5dd!important;border-radius:8px!important}
 [data-testid="stFileUploader"]{background:#fff;border:1px dashed #cfd6e0;border-radius:8px;padding:.25rem}
 [data-testid="stExpander"]{background:#fff!important;border:1px solid var(--line)!important;border-radius:8px!important;box-shadow:var(--shadow)!important}
 [data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:var(--shadow)}

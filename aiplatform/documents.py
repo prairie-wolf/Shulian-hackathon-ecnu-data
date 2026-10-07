@@ -38,7 +38,8 @@ def read_tabular(path):
                 "engine": "pandas"}
     if ext == ".json":
         import pandas as pd
-        data = json.load(open(path, encoding="utf-8"))
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
         if isinstance(data, list) and data and isinstance(data[0], dict):
             df = pd.DataFrame(data)
             return {"sheets": {"default": (list(df.columns), df.astype(object).where(df.notna(), None).values.tolist())},
@@ -77,7 +78,8 @@ def read_document(path):
             except ImportError:
                 text = ""
     elif ext in (".txt", ".md"):
-        text = open(path, encoding="utf-8", errors="ignore").read()
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            text = fh.read()
     return {"text": text, "tables": tables, "chars": len(text)}
 
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import uuid
 import json
 import os
 import shutil
@@ -35,7 +37,7 @@ from aiplatform import privates
 from aiplatform.ai_clients import PRESETS, call_client, list_clients, register_client
 from aiplatform.build_platform import build
 from aiplatform.semantic import GenericSemanticQuery
-from aiplatform.upload import ingest_file, save_upload_bytes
+from aiplatform.upload import ingest_file, remove_uploaded_source, save_upload_bytes
 
 st.set_page_config(page_title="ECNU DataOS · 面向 AI 的大数据平台", layout="wide",
                    page_icon="AI", initial_sidebar_state="expanded")
@@ -252,7 +254,37 @@ def render_overview() -> None:
         )
 
 
-def _handle_upload(uploaded) -> None:
+def _preview_uploaded(uploaded):
+    if uploaded is None:
+        return None
+    name = uploaded.name.lower()
+    data = uploaded.getvalue()
+    try:
+        if name.endswith(".csv"):
+            return pd.read_csv(io.StringIO(data.decode("utf-8-sig")), nrows=5)
+        if name.endswith((".xlsx", ".xls")):
+            return pd.read_excel(io.BytesIO(data), nrows=5)
+        if name.endswith(".json"):
+            return pd.read_json(io.StringIO(data.decode("utf-8-sig"))).head(5)
+    except Exception as exc:
+        return f"预览失败：{type(exc).__name__}: {exc}"
+    return None
+
+
+def _remove_public_source(source_id: str) -> None:
+    remove_uploaded_source(graph, cat, source_id)
+    _rebuild_query()
+
+
+def _delete_private_partition(uid: str, partition_id: str) -> None:
+    privates.delete_partition(uid, partition_id)
+    remaining = privates.list_partitions(uid)
+    st.session_state.cur_partition = remaining[0]["id"] if remaining else "user_0"
+    _rebuild_query()
+
+
+def _handle_upload(uploaded, allow_generic=False, skip_empty=True,
+                   max_rows=5000, include_unmapped=False) -> None:
     if uploaded is None:
         st.warning("请先选择一个文件。")
         return
@@ -269,12 +301,17 @@ def _handle_upload(uploaded) -> None:
                 priv_graph = privates.load_partition_g(uid, partition)
                 proxy = privates.UserGraphProxy(onto, priv_graph)
                 source_id = f"priv_{privates.safe_uid(uid)}_{partition}_{_stable_hash(display_name, 10000)}"
-                report = ingest_file(proxy, cat, tmp_path, display_name, source_id=source_id)
-                privates.save_partition(uid, partition, priv_graph)
+                report = ingest_file(proxy, cat, tmp_path, display_name, source_id=source_id,
+                                     allow_generic=allow_generic, skip_empty=skip_empty,
+                                     max_rows=int(max_rows), include_unmapped=include_unmapped)
+                if not report.get("error"):
+                    privates.save_partition(uid, partition, priv_graph)
                 _rebuild_query()
             else:
-                source_id = f"ds_upload_{_stable_hash(display_name, 100000)}"
-                report = ingest_file(graph, cat, tmp_path, display_name, source_id=source_id)
+                source_id = f"ds_upload_{uuid.uuid4().hex}"
+                report = ingest_file(graph, cat, tmp_path, display_name, source_id=source_id,
+                                     allow_generic=allow_generic, skip_empty=skip_empty,
+                                     max_rows=int(max_rows), include_unmapped=include_unmapped)
                 _rebuild_query()
             st.session_state.setdefault("uploads", []).append(report)
             if report.get("error"):
@@ -302,18 +339,49 @@ def render_data() -> None:
         {"label": "私有三元组", "value": f"{private_count:,}", "sub": "仅当前账户可见" if logged else "登录后可上传", "tone": "indigo"},
         {"label": "本体实体", "value": f"{stats['entities']:,}", "sub": "跨域语义对象", "tone": "amber"},
     ])
+    generic_count = stats["classes"].get("GenericRecord", 0)
+    with st.expander("GenericRecord（通用记录）是什么？", expanded=generic_count > 0):
+        st.markdown(
+            "当上传文件无法自动判断为 Scholar、Publication、Institution、Company 等本体类时，"
+            "系统会把它标记为 **GenericRecord（通用记录）**。它主要保留名称、描述和来源，"
+            "能参与基础检索，但不保证预算、负责人等业务字段都能问答。\n\n"
+            "如果这些字段对后续分析重要，建议在上传前统一列名、删除无关列，或关闭“允许写入 GenericRecord”。"
+        )
+        if generic_count:
+            st.caption(f"当前图谱中有 {generic_count:,} 条 GenericRecord 记录。")
     left, right = st.columns([1, 1.15], gap="large")
     with left:
-        section_title("接入新数据", "支持 CSV、Excel、Word、PDF、JSON、图片和文本")
+        section_title("接入新数据", "支持 CSV、Excel、Word、PDF、JSON、图片和文本；导入前可预览与筛选")
         uploaded = st.file_uploader(
             "选择文件",
             type=["csv", "xlsx", "xls", "docx", "pdf", "json", "png", "jpg", "jpeg", "txt", "md"],
             label_visibility="collapsed",
         )
+        with st.expander("导入筛选与提炼", expanded=False):
+            allow_generic = st.toggle(
+                "允许写入 GenericRecord（未识别类别）",
+                value=False,
+                help="关闭后，无法识别本体类别的文件会被跳过，不会产生低价值通用记录。",
+            )
+            include_unmapped = st.toggle(
+                "保留未识别字段到描述",
+                value=False,
+                help="关闭后，未匹配到本体属性的列会被过滤，避免低质量字段混入图谱。",
+            )
+            skip_empty = st.toggle("跳过空行和空主键", value=True)
+            max_rows = st.number_input("整个文件最多导入行数", min_value=1, max_value=100000,
+                                       value=5000, step=500)
+        preview = _preview_uploaded(uploaded)
+        if isinstance(preview, str):
+            st.warning(preview)
+        elif preview is not None and not preview.empty:
+            st.caption(f"文件预览：{uploaded.name}（前 5 行）")
+            st.dataframe(preview, width="stretch", hide_index=True)
         if st.button("开始本体化", type="primary", width="stretch"):
-            _handle_upload(uploaded)
+            _handle_upload(uploaded, allow_generic=allow_generic, skip_empty=skip_empty,
+                           max_rows=int(max_rows), include_unmapped=include_unmapped)
         scope = "私人库分区" if logged else "公共数据资产"
-        st.caption(f"当前写入范围：{scope}")
+        st.caption(f"当前写入范围：{scope}。单文件上限 25 MB，默认最多导入 5000 行。")
     with right:
         section_title("公共分区", "平台内置的 19 个数据源已完成统一建模")
         rows = public_sources()
@@ -324,6 +392,19 @@ def render_data() -> None:
         with st.expander("查看全部公共数据源", expanded=False):
             st.dataframe(pd.DataFrame([{"数据源": s["name"], "类型": s["kind"], "行数": s["rows"]}
                                        for s in rows]), width="stretch", hide_index=True)
+        uploaded_sources = [s for s in rows if s["source_id"].startswith("ds_upload_")]
+        if uploaded_sources:
+            section_title("手动清理上传数据", "删除本次上传进入图谱的数据和临时原件，内置数据源不受影响")
+            for source in uploaded_sources:
+                item_left, item_right = st.columns([4, 1])
+                item_left.markdown(f"**{source['name']}** · {source['kind']} · {source['rows']:,} 行")
+                if item_right.button("删除", key=f"delete_public_{source['source_id']}"):
+                    try:
+                        _remove_public_source(source["source_id"])
+                    except (OSError, ValueError) as exc:
+                        st.error(f"删除失败：{exc}")
+                    else:
+                        st.rerun()
     if logged:
         section_title("私人库", "上传到私人分区的数据只参与当前账户的语义查询")
         uid = st.session_state.uid
@@ -344,6 +425,18 @@ def render_data() -> None:
                     st.rerun()
                 else:
                     st.warning("请输入分区名称")
+            st.divider()
+            confirm_delete = st.checkbox("确认删除当前分区", key=f"confirm_delete_{selected}")
+            if st.button("删除当前分区", key=f"delete_private_{selected}", width="stretch"):
+                if confirm_delete:
+                    try:
+                        _delete_private_partition(uid, selected)
+                    except OSError as exc:
+                        st.error(f"删除失败：{exc}")
+                    else:
+                        st.rerun()
+                else:
+                    st.warning("请先勾选确认删除。")
         with col2:
             st.dataframe(pd.DataFrame([{"分区": p["name"], "标识": p["id"], "三元组": p["triples"]}
                                        for p in parts]), width="stretch", hide_index=True)
@@ -415,21 +508,21 @@ def _extract_names(result: dict) -> list[str]:
 
 
 def _humanize_result(question: str, result: dict) -> str:
-    apology = ("抱歉，这个问题我暂时还没理解清楚。你可以换个更明确的问法试试，"
-               "例如：“华东师范大学有哪些学者？”、“大语言模型趋势”、"
-               "“物流快递行业有哪些公司？”。")
+    apology = ("抱歉，根据本平台当前已接入的数据，我暂时没找到可回答这项问题的记录。"
+               "你可以换成更明确的平台数据问题试试，例如：“华东师范大学有哪些学者？”、"
+               "“大语言模型趋势”、“物流快递行业有哪些公司？”。")
     if not isinstance(result, dict):
         return apology
     intent = result.get("intent", "unknown")
     if result.get("error"):
-        return "抱歉，这次查询没有拿到可用结果。你可以换个问法，或稍后再试。"
+        return "抱歉，根据本平台当前已接入的数据，这次查询没有拿到可用结果。你可以换个问法，或稍后再试。"
     if intent in ("unknown", "none", "unsupported"):
         return apology
     if intent == "entity_detail":
         props = result.get("properties") or {}
         props_text = "、".join(f"{k}：{v}" for k, v in list(props.items())[:8])
         if props_text:
-            return f"已查到“{result.get('entity', '该实体')}”的详情：{props_text}。"
+            return f"根据本平台已接入的数据，已查到“{result.get('entity', '该实体')}”的详情：{props_text}。"
         return apology
     if intent == "overview":
         overview_terms = ("平台", "数据", "本体", "概览", "总览", "覆盖", "规模", "统计", "有哪些类", "多少")
@@ -438,7 +531,7 @@ def _humanize_result(question: str, result: dict) -> str:
         classes = result.get("classes") or {}
         if classes:
             summary = "、".join(f"{k} {v} 个" for k, v in list(classes.items())[:12])
-            return f"平台当前覆盖 {len(classes)} 类数据：{summary}。"
+            return f"根据本平台已接入的数据，平台当前覆盖 {len(classes)} 类数据：{summary}。"
         return apology
     names = _extract_names(result)
     if names:
@@ -459,12 +552,12 @@ def _humanize_result(question: str, result: dict) -> str:
             "cls_list": "实例",
             "list_sources": "数据源",
         }.get(intent, "结果")
-        return f"这个问题共查到 {count} 条{label}相关数据，主要结果：{'、'.join(names)}。"
+        return f"根据本平台已接入的数据，这个问题共查到 {count} 条{label}相关数据，主要结果：{'、'.join(names)}。"
     if intent == "trend" or intent == "year_distribution":
         rows = result.get("data") or []
         if rows:
             total = sum(int(x.get("count") or 0) for x in rows if isinstance(x, dict))
-            return f"已统计 {len(rows)} 个时间点，累计 {total} 条记录。也可以看右侧趋势图。"
+            return f"根据本平台已接入的数据，已统计 {len(rows)} 个时间点，累计 {total} 条记录。也可以看右侧趋势图。"
     return apology
 
 
@@ -478,7 +571,7 @@ def _answer_with_ai(question: str, picked: dict) -> tuple[dict, list[dict], str]
         trace.append({"step": "平台引擎返回结构化结果，并生成人话摘要"})
         return result, trace, answer
     response = call_client(picked["key"], [
-        {"role": "system", "content": "你是数据平台助手。只依据平台查询结果作答，用简洁中文回答，不得编造。"},
+        {"role": "system", "content": "你是平台内数据问答助手。只能依据【平台查询结果】中本平台已接入的数据作答，用简洁中文回答，不得使用平台外知识，不得编造。平台没有记录时必须明确回答“根据本平台当前已接入的数据，暂未收录该数据”。"},
         {"role": "user", "content": f"用户问题：{question}\n\n平台查询结果：\n{json.dumps(result, ensure_ascii=False)}"},
     ], timeout=180)
     answer = response.get("content") or _humanize_result(question, result)
@@ -493,7 +586,10 @@ def _scroll_to_latest() -> None:
             """<script>
 setTimeout(() => {
   const el = document.querySelector('.st-key-chat_history');
-  if (el) el.scrollIntoView({behavior: 'smooth', block: 'end'});
+  if (el) {
+    el.scrollTop = el.scrollHeight;
+    el.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  }
 }, 80);
 </script>""",
             unsafe_allow_javascript=True,
@@ -520,8 +616,15 @@ def render_chat() -> None:
     left, right = st.columns([1.28, 1], gap="large")
     with left:
         if st.session_state.get("messages"):
-            if st.button("跳到最新", key="scroll_button", width="stretch"):
+            nav_a, nav_b = st.columns(2)
+            if nav_a.button("跳到最新", key="scroll_button", width="stretch"):
                 st.session_state["scroll_to_chat"] = True
+                st.rerun()
+            if nav_b.button("清空对话", key="clear_chat_button", width="stretch"):
+                st.session_state["messages"] = []
+                st.session_state["last"] = None
+                st.session_state.pop("pending_chat", None)
+                st.session_state["scroll_to_chat"] = False
                 st.rerun()
             latest_user = next((m["content"] for m in reversed(st.session_state.messages)
                                 if m["role"] == "user"), None)
@@ -530,7 +633,7 @@ def render_chat() -> None:
                     f'<div class="panel-soft"><b>最新问题</b><br>{esc(latest_user)}</div>',
                     unsafe_allow_html=True,
                 )
-        chat_history = st.container(key="chat_history")
+        chat_history = st.container(key="chat_history", height=440)
         with chat_history:
             for msg in st.session_state.get("messages", []):
                 with st.chat_message(msg["role"]):

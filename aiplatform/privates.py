@@ -136,6 +136,19 @@ def save_partition(uid, pid, g):
     return out
 
 
+def delete_partition(uid, pid):
+    """删除指定私人分区及其元数据，返回实际删除的路径。"""
+    d = user_priv_dir(uid)
+    stem = _valid_name(pid)
+    removed = []
+    for suffix in (".ttl", ".meta.json"):
+        path = os.path.join(d, stem + suffix)
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(path)
+    return removed
+
+
 def merge_public_user(public_g, priv_g):
     """合并公共图 + 用户私有图 → 仅用于查询（不落盘，不改公共图）"""
     m = Graph()

@@ -115,6 +115,10 @@ class SourceCatalog:
     def list(self):
         return list(self.sources.values())
 
+    def remove(self, source_id):
+        """Remove a runtime source registration."""
+        return self.sources.pop(source_id, None)
+
 
 class SemanticMapper:
     """本体性转化引擎：把原始数据行，按语义映射，转化成本体三元组"""

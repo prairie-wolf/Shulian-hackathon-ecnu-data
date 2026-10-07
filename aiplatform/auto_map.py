@@ -96,7 +96,7 @@ def guess_relation(col, value_samples, known_entity_cols):
     return None
 
 
-def infer_mapping(filename, columns, sample_rows, sheet_name=None):
+def infer_mapping(filename, columns, sample_rows, sheet_name=None, include_unmapped=False):
     """
     核心：为上传的表推断一份平台可用的语义映射
     返回 {"mappings": [...], "summary": {...}}
@@ -120,6 +120,7 @@ def infer_mapping(filename, columns, sample_rows, sheet_name=None):
 
     properties = []
     relation_cols = []
+    unmapped_columns = []
     for c in columns:
         if c == id_col:
             continue
@@ -161,7 +162,9 @@ def infer_mapping(filename, columns, sample_rows, sheet_name=None):
         if prop:
             properties.append({"column": c, "property": prop, "datatype": dtype})
         else:
-            properties.append({"column": c, "property": "description", "datatype": "str"})
+            unmapped_columns.append(c)
+            if include_unmapped:
+                properties.append({"column": c, "property": "description", "datatype": "str"})
 
     # 名称列：优先映射为 label（精确匹配优先，避免被"id/编号/维度"类列抢走）
     label_col = None
@@ -204,6 +207,7 @@ def infer_mapping(filename, columns, sample_rows, sheet_name=None):
             "inferred_class": cls, "id_column": id_col, "id_template": tpl,
             "label_column": label_col, "properties": len(properties),
             "relations": [r["predicate"] for r in relation_cols],
+            "unmapped_columns": unmapped_columns,
         },
     }
 
